@@ -1,0 +1,6 @@
+# Build dependencies
+nanobind>=2.0.0
+cmake>=3.15
+
+# Runtime dependencies
+# (none - all dependencies are statically linked)

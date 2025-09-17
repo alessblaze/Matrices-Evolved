@@ -1,0 +1,64 @@
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust build artifacts
+rust/target/
+rust/Cargo.lock
+*.rlib
+*.pdb
+
+# C++ build artifacts
+*.o
+*.obj
+*.lib
+*.dll
+*.dylib
+*.a
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# External dependencies
+boost-prefix/
+aws-lc-prefix/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation build
+docs/_build/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/

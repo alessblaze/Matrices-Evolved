@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools", "wheel", "nanobind>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matrices_evolved"
+version = "1.0.0"
+description = "High-performance Matrix event signing library"
+authors = [{name = "Aless Microsystems", email = "albertalesso@gmail.com"}]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["nanobind>=2.0.0"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers", 
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+
+[tool.scikit-build]
+minimum-version = "0.4"
+build-dir = "build/{wheel_tag}"
+

@@ -1,0 +1,45 @@
+[package]
+name = "matrices_evolved"
+version = "1.0.0"
+edition = "2021"
+authors = ["Albert Blasczykowski<albertalesso@gmail.com>"]
+license = "AGPL-3.0"
+description = "High-performance Matrix event signing library with Rust PyO3 bindings"
+repository = "https://github.com/alessblaze/matrices_evolved"
+homepage = "https://github.com/alessblaze/matrices_evolved"
+
+[lib]
+name = "matrices_evolved_rust"
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.25.1", features = [
+    "macros",
+    "anyhow",
+    "abi3",
+    "abi3-py39",
+] }
+serde = { version = "1.0.144", features = ["derive"] }
+serde_json = "1.0.85"
+base64 = "0.22"
+sha2 = "0.10"
+ed25519 = "2.2"
+aws-lc-rs = "1.8"  # AWS-optimized crypto with FIPS validation
+pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
+pythonize = "0.25.0"
+p256 = "0.13"
+rsa = "0.9"
+hashbrown = "0.16.0"
+ahash = "0.8.11"
+rand = "0.8"
+lru = "0.12"
+tokio = { version = "1.0", features = ["sync"] }
+rustc-hash = "2.1.1"  
+parking_lot = "0.12"
+ryu = "=1.0.20"
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
