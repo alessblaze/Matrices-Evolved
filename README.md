@@ -155,83 +155,83 @@ You would need a wrapper to function these properly. these expose core functiona
 the bindings are already there but currently not written in api docs.
 
 # Synthetic Benchmarks
-ure Python LRU:
-synmark.suites.lrucache_auto: Mean +- std dev: 3.17 us +- 0.08 us
-synmark.suites.lrucache_evict_auto: Mean +- std dev: 3.06 us +- 0.08 us
-Rust Wrapper LRU:
-synmark.suites.lrucache_auto: Mean +- std dev: 900 ns +- 19 ns
-synmark.suites.lrucache_evict_auto: Mean +- std dev: 879 ns +- 20 ns
+```
+Pure Python LRU:
+   synmark.suites.lrucache_auto: Mean +- std dev: 3.17 us +- 0.08 us
+   synmark.suites.lrucache_evict_auto: Mean +- std dev: 3.06 us +- 0.08 us
+   Rust Wrapper LRU:
+   synmark.suites.lrucache_auto: Mean +- std dev: 900 ns +- 19 ns
+   synmark.suites.lrucache_evict_auto: Mean +- std dev: 879 ns +- 20 ns
 
 Formula:
-Improvement (%) = ((Python_time - Rust_time) / Python_time) × 100
+   Improvement (%) = ((Python_time - Rust_time) / Python_time) × 100
 
 Results:
-1. lrucache_auto:       ((3170 - 900) / 3170) × 100 ≈ 71.6% faster
-2. lrucache_evict_auto: ((3060 - 879) / 3060) × 100 ≈ 71.3% faster
+    1. lrucache_auto:       ((3170 - 900) / 3170) × 100 ≈ 71.6% faster
+    2. lrucache_evict_auto: ((3060 - 879) / 3060) × 100 ≈ 71.3% faster
 
 
 crypto:
 Pure rust bench:
-benches/crypto_bench.rs (/mnt/build/Tests/signal/hula/synapse/target/release/deps/crypto_bench-b4730a09c1fd000f)
-Gnuplot not found, using plotters backend
-Benchmarking pure_rust_canonicalization
-Benchmarking pure_rust_canonicalization: Warming up for 3.0000 s
-Benchmarking pure_rust_canonicalization: Collecting 100 samples in estimated 5.0027 s (9.1M iterations)
-Benchmarking pure_rust_canonicalization: Analyzing
-pure_rust_canonicalization
+    benches/crypto_bench.rs (/mnt/build/Tests/signal/hula/synapse/target/release/deps/crypto_bench-b4730a09c1fd000f)
+    Gnuplot not found, using plotters backend
+    Benchmarking pure_rust_canonicalization
+    Benchmarking pure_rust_canonicalization: Warming up for 3.0000 s
+    Benchmarking pure_rust_canonicalization: Collecting 100 samples in estimated 5.0027 s (9.1M iterations)
+    Benchmarking pure_rust_canonicalization: Analyzing
+    pure_rust_canonicalization
                         time:   [533.77 ns 534.46 ns 535.21 ns]
-Benchmarking pure_rust_ed25519_sign
-Benchmarking pure_rust_ed25519_sign: Warming up for 3.0000 s
-Benchmarking pure_rust_ed25519_sign: Collecting 100 samples in estimated 5.0250 s (601k iterations)
-Benchmarking pure_rust_ed25519_sign: Analyzing
-pure_rust_ed25519_sign  time:   [8.3256 µs 8.3447 µs 8.3633 µs]
-Found 2 outliers among 100 measurements (2.00%)
-  2 (2.00%) high severe
-Benchmarking pure_rust_base64_encode
-Benchmarking pure_rust_base64_encode: Warming up for 3.0000 s
-Benchmarking pure_rust_base64_encode: Collecting 100 samples in estimated 5.0004 s (26M iterations)
-Benchmarking pure_rust_base64_encode: Analyzing
-pure_rust_base64_encode time:   [194.77 ns 195.08 ns 195.39 ns]
-Found 3 outliers among 100 measurements (3.00%)
-  1 (1.00%) low severe
-  2 (2.00%) high severe
+    Benchmarking pure_rust_ed25519_sign
+    Benchmarking pure_rust_ed25519_sign: Warming up for 3.0000 s
+    Benchmarking pure_rust_ed25519_sign: Collecting 100 samples in estimated 5.0250 s (601k iterations)
+    Benchmarking pure_rust_ed25519_sign: Analyzing
+    pure_rust_ed25519_sign  time:   [8.3256 µs 8.3447 µs 8.3633 µs]
+    Found 2 outliers among 100 measurements (2.00%)
+      2 (2.00%) high severe
+    Benchmarking pure_rust_base64_encode
+    Benchmarking pure_rust_base64_encode: Warming up for 3.0000 s
+    Benchmarking pure_rust_base64_encode: Collecting 100 samples in estimated 5.0004 s (26M iterations)
+    Benchmarking pure_rust_base64_encode: Analyzing
+    pure_rust_base64_encode time:   [194.77 ns 195.08 ns 195.39 ns]
+    Found 3 outliers among 100 measurements (3.00%)
+      1 (1.00%) low severe
+      2 (2.00%) high severe
 
 Synmark bench Crypto:
 Note: C++ uses an iterative approach to json structure walk, Rust uses recursion.
 Running PYTHON implementation:
-canonicalization: 1.99 μs per operation
-base64_encoding: 0.68 μs per operation
-base64_decoding: 1.34 μs per operation
-content_hash: 2.41 μs per operation
-json_signing: 19.75 μs per operation
-signature_verification: 48.15 μs per operation
-synmark.suites.crypto_operations_auto: Mean +- std dev: 73.0 us +- 1.5 us
+    canonicalization: 1.99 μs per operation
+    base64_encoding: 0.68 μs per operation
+    base64_decoding: 1.34 μs per operation
+    content_hash: 2.41 μs per operation
+    json_signing: 19.75 μs per operation
+    signature_verification: 48.15 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 73.0 us +- 1.5 us
 
 Running RUST implementation:
-canonicalization: 1.45 μs per operation
-base64_encoding: 4.66 μs per operation
-base64_decoding: 0.36 μs per operation
-content_hash: 1.42 μs per operation
-json_signing: 18.18 μs per operation
-signature_verification: 36.82 μs per operation
-synmark.suites.crypto_operations_auto: Mean +- std dev: 63.1 us +- 2.2 us  
+    canonicalization: 1.45 μs per operation
+    base64_encoding: 4.66 μs per operation
+    base64_decoding: 0.36 μs per operation
+    content_hash: 1.42 μs per operation
+    json_signing: 18.18 μs per operation
+    signature_verification: 36.82 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 63.1 us +- 2.2 us  
 
 Running C++ implementation:
-canonicalization: 0.62 μs per operation
-base64_encoding: 1.12 μs per operation
-base64_decoding: 1.96 μs per operation
-content_hash: 0.86 μs per operation
-json_signing: 15.95 μs per operation
-signature_verification: 33.53 μs per operation
-synmark.suites.crypto_operations_auto: Mean +- std dev: 53.7 us +- 1.9 us
+    canonicalization: 0.62 μs per operation
+    base64_encoding: 1.12 μs per operation
+    base64_decoding: 1.96 μs per operation
+    content_hash: 0.86 μs per operation
+    json_signing: 15.95 μs per operation
+    signature_verification: 33.53 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 53.7 us +- 1.9 us
 
 Stream Change Bench Results :
 Pure python:
-synmark.suites.stream_change_cache_auto: Mean +- std dev: 2.26 us +- 0.12 us
+    synmark.suites.stream_change_cache_auto: Mean +- std dev: 2.26 us +- 0.12 us
 Rust Wrapper:
-synmark.suites.stream_change_cache_rust_auto: Mean +- std dev: 559 ns +- 28 ns
-
-About 75% faster.
+    synmark.suites.stream_change_cache_rust_auto: Mean +- std dev: 559 ns +- 28 ns
+```
 
 ## Contributing
 
