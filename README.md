@@ -1,6 +1,8 @@
-# matrices_evolved
+# Matrices Evolved
+<img width="1536" height="1024" alt="matrices_evolved" src="https://github.com/user-attachments/assets/49763adb-6660-438d-9791-0a3a0855d5a3" />
 
-High-performance Python bindings for Matrix protocol event signing and cryptography with dual C++ and Rust implementations.
+
+
 
 ## Features
 
@@ -146,7 +148,10 @@ matrices_evolved/
 │   └── rust.py            # Rust wrapper
 └── CMakeLists.txt         # Build configuration
 ```
-
+## In Progress
+LRU, Stream Cache.
+You would need a wrapper to function these properly. these expose core functionality in cache.rs and event_signing.rs but more needed on python wrapper.
+the bindings are already there but currently not written in api docs.
 ## Contributing
 
 1. Fork the repository
