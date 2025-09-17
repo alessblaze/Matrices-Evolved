@@ -13,7 +13,7 @@
 - **Hash Computation** - SHA256 content and reference hashing
 - **Key Management** - Generate, encode, and manage signing keys
 - **Matrix Protocol Compatible** - Drop-in replacement for Matrix implementations
-- **High Performance** - 10-100x faster than pure Python implementations
+- **High Performance** - 10-100% faster than pure Python implementations
 
 ## Installation
 
