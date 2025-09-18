@@ -18,9 +18,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/pair.h>
-#include <nanobind/stl/optional.h>
-#include <unordered_map>
-#include <array>
+
 #include <cstring>
 #include <span>
 #include <openssl/evp.h>
@@ -33,7 +31,6 @@
 #include <map>
 #include <algorithm>
 #include <sstream>
-#include <iomanip>
 #include <iostream>
 #include <cstdlib>
 #include <stdexcept>
@@ -46,7 +43,7 @@
 // Disable AVX2 SIMD for JSON canonicalization
 //#define DISABLE_AVX2_JSON_SIMD
 // Separate controls for base64 encoder/decoder
-//#define DISABLE_AVX2_BASE64_ENCODER
+//#define DISABLE_SSE_BASE64_ENCODER
 //#define DISABLE_AVX2_BASE64_DECODER
 #endif
 
@@ -619,7 +616,7 @@ thread_local std::string base64_buffer;
 thread_local std::vector<uint8_t> decode_buffer;
 thread_local std::vector<uint8_t> signature_buffer(64); // Ed25519 signature size
 thread_local std::vector<uint8_t> hash_buffer(32);     // SHA256 hash size
-thread_local std::vector<std::string> key_sort_buffer;
+
 
 // Fast base64 decode table - pre-computed for speed
 static constexpr uint8_t base64_decode_table[256] = {
@@ -768,10 +765,7 @@ static inline __m256i dec_reshuffle(__m256i in) {
         srclen -= 32;
     }
     
-    // Handle remaining chars with single iteration
-
-    
-    // AVX scalar path for remaining bytes when AVX2 is available
+    // Process remaining bytes with scalar fallback
     while (srclen >= 16) {
         // Load 16 chars, decode with AVX scalar instructions
         __m128i chars = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
@@ -847,7 +841,7 @@ static inline __m256i dec_reshuffle(__m256i in) {
     return decode_buffer;
 }
 
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_BASE64_ENCODER)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER)
 // Base64 alphabet lookup table
 static constexpr char base64_chars[64] = {
     'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
@@ -857,12 +851,12 @@ static constexpr char base64_chars[64] = {
 };
 
 /**
- * Fast base64 encoder using direct 6-bit extraction
+ * Fast base64 encoder using SSE 128-bit SIMD instructions
  * 
  * Algorithm:
  * 1. Process 48 input bytes as 16 triplets (3 bytes each)
  * 2. Extract 4 base64 indices per triplet using bit shifts
- * 3. Lookup base64 characters from alphabet table
+ * 3. Lookup base64 characters from alphabet table using SSE shuffle
  * 4. Produces exactly 64 base64 characters per 48-byte block
  * 
  * Performance: ~2-3x faster than OpenSSL for large inputs
@@ -870,7 +864,7 @@ static constexpr char base64_chars[64] = {
  * @param data Input byte vector to encode
  * @return Base64 encoded string (unpadded for Matrix protocol)
  */
-[[gnu::hot, gnu::flatten]] inline std::string fast_avx2_base64_encode(const std::vector<uint8_t>& data) {
+[[gnu::hot, gnu::flatten]] inline std::string fast_sse_base64_encode(const std::vector<uint8_t>& data) {
     size_t len = data.size();
     size_t out_len = ((len + 2) / 3) * 4;
     base64_buffer.resize(out_len);
@@ -879,33 +873,165 @@ static constexpr char base64_chars[64] = {
     char* dest = base64_buffer.data();
     const char* const dest_orig = dest;
     
-    // Process 48→64 byte blocks correctly
-    while (len >= 48) {
-        // Direct 6-bit extraction from 48 bytes → 64 base64 chars
-        alignas(64) uint8_t indices[64];
+    // Hoist all constants outside loops for better performance
+    static const __m128i mask6 = _mm_set1_epi32(0x3f);
+    static const __m128i trip_shuffle = _mm_setr_epi8(
+        2, 1, 0, (char)0x80,   // lane0: bytes 2,1,0 to match (b0<<16)|(b1<<8)|b2
+        5, 4, 3, (char)0x80,   // lane1: bytes 5,4,3
+        8, 7, 6, (char)0x80,   // lane2: bytes 8,7,6
+       11,10, 9, (char)0x80    // lane3: bytes 11,10,9
+    );
+    // Single 64-byte LUT split into 4x16 for pshufb
+    static const __m128i lut0 = _mm_setr_epi8(
+        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'
+    );
+    static const __m128i lut1 = _mm_setr_epi8(
+        'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f'
+    );
+    static const __m128i lut2 = _mm_setr_epi8(
+        'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v'
+    );
+    static const __m128i lut3 = _mm_setr_epi8(
+        'w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/'
+    );
+    // Hoist comparison constants
+    static const __m128i const16 = _mm_set1_epi8(16);
+    static const __m128i const32 = _mm_set1_epi8(32);
+    static const __m128i const48 = _mm_set1_epi8(48);
+    
+    // Process large blocks with 2x unrolling optimization
+    while (len >= 64) {
+        // Only process 2 blocks if we have 96+ bytes, otherwise just 1
+        int blocks_to_process = (len >= 96) ? 2 : 1;
+        int bytes_to_process = blocks_to_process * 48;
         
-        // TODO: Vectorize 6-bit extraction using AVX2 shuffle/shift operations
-        // Extract 6-bit values directly from input bytes
-        for (int i = 0; i < 16; ++i) {
-            uint32_t triple = (src[i*3] << 16) | (src[i*3+1] << 8) | src[i*3+2];
-            indices[i*4] = (triple >> 18) & 0x3f;
-            indices[i*4+1] = (triple >> 12) & 0x3f;
-            indices[i*4+2] = (triple >> 6) & 0x3f;
-            indices[i*4+3] = triple & 0x3f;
+        for (int block = 0; block < blocks_to_process; ++block) {
+            const uint8_t* block_src = src + block * 48;
+            char* block_dest = dest + block * 64;
+        
+            // Process 12 triplets with SIMD (bounds guaranteed safe)
+            for (int i = 0; i < 12; i += 4) {
+                __m128i in = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block_src + i*3));
+                
+                __m128i packed = _mm_shuffle_epi8(in, trip_shuffle);
+                
+                __m128i idx0 = _mm_and_si128(_mm_srli_epi32(packed, 18), mask6);
+                __m128i idx1 = _mm_and_si128(_mm_srli_epi32(packed, 12), mask6);
+                __m128i idx2 = _mm_and_si128(_mm_srli_epi32(packed, 6), mask6);
+                __m128i idx3 = _mm_and_si128(packed, mask6);
+                
+                __m128i lo01 = _mm_unpacklo_epi32(idx0, idx1);
+                __m128i lo23 = _mm_unpacklo_epi32(idx2, idx3);
+                __m128i hi01 = _mm_unpackhi_epi32(idx0, idx1);
+                __m128i hi23 = _mm_unpackhi_epi32(idx2, idx3);
+                
+                __m128i quad0 = _mm_unpacklo_epi64(lo01, lo23);
+                __m128i quad1 = _mm_unpackhi_epi64(lo01, lo23);
+                __m128i quad2 = _mm_unpacklo_epi64(hi01, hi23);
+                __m128i quad3 = _mm_unpackhi_epi64(hi01, hi23);
+                
+                __m128i packed01 = _mm_packs_epi32(quad0, quad1);
+                __m128i packed23 = _mm_packs_epi32(quad2, quad3);
+                __m128i indices_bytes = _mm_packus_epi16(packed01, packed23);
+                
+                __m128i mask_32 = _mm_cmplt_epi8(indices_bytes, const32);
+                __m128i lo_result = _mm_blendv_epi8(
+                    _mm_shuffle_epi8(lut1, _mm_sub_epi8(indices_bytes, const16)),
+                    _mm_shuffle_epi8(lut0, indices_bytes),
+                    _mm_cmplt_epi8(indices_bytes, const16)
+                );
+                __m128i hi_result = _mm_blendv_epi8(
+                    _mm_shuffle_epi8(lut3, _mm_sub_epi8(indices_bytes, const48)),
+                    _mm_shuffle_epi8(lut2, _mm_sub_epi8(indices_bytes, const32)),
+                    _mm_cmplt_epi8(indices_bytes, const48)
+                );
+                __m128i result = _mm_blendv_epi8(hi_result, lo_result, mask_32);
+                
+                if (data.size() >= 1024) {
+                    _mm_stream_si128(reinterpret_cast<__m128i*>(block_dest + i * 4), result);
+                } else {
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(block_dest + i * 4), result);
+                }
+            }
+            
+            // Handle remaining 4 triplets with scalar
+            for (int i = 12; i < 16; ++i) {
+                uint32_t triple = (block_src[i*3] << 16) | (block_src[i*3+1] << 8) | block_src[i*3+2];
+                block_dest[i*4] = base64_chars[(triple >> 18) & 0x3f];
+                block_dest[i*4+1] = base64_chars[(triple >> 12) & 0x3f];
+                block_dest[i*4+2] = base64_chars[(triple >> 6) & 0x3f];
+                block_dest[i*4+3] = base64_chars[triple & 0x3f];
+            }
         }
         
-        // TODO: Vectorize character lookup using dual AVX2 shuffle tables
-        // Translate indices to base64 characters
-        for (int i = 0; i < 64; ++i) {
-            dest[i] = base64_chars[indices[i]];
+        src += bytes_to_process;
+        dest += blocks_to_process * 64;
+        len -= bytes_to_process;
+    }
+    
+    // Handle single 48-byte block
+    while (len >= 48) {
+        // Process 12 triplets with SIMD
+        for (int i = 0; i < 12; i += 4) {
+            __m128i in = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i*3));
+            
+            __m128i packed = _mm_shuffle_epi8(in, trip_shuffle);
+            
+            __m128i idx0 = _mm_and_si128(_mm_srli_epi32(packed, 18), mask6);
+            __m128i idx1 = _mm_and_si128(_mm_srli_epi32(packed, 12), mask6);
+            __m128i idx2 = _mm_and_si128(_mm_srli_epi32(packed, 6), mask6);
+            __m128i idx3 = _mm_and_si128(packed, mask6);
+            
+            // Interleave indices for correct output ordering
+            __m128i lo01 = _mm_unpacklo_epi32(idx0, idx1);
+            __m128i lo23 = _mm_unpacklo_epi32(idx2, idx3);
+            __m128i hi01 = _mm_unpackhi_epi32(idx0, idx1);
+            __m128i hi23 = _mm_unpackhi_epi32(idx2, idx3);
+            
+            __m128i quad0 = _mm_unpacklo_epi64(lo01, lo23);
+            __m128i quad1 = _mm_unpackhi_epi64(lo01, lo23);
+            __m128i quad2 = _mm_unpacklo_epi64(hi01, hi23);
+            __m128i quad3 = _mm_unpackhi_epi64(hi01, hi23);
+            
+            __m128i packed01 = _mm_packs_epi32(quad0, quad1);
+            __m128i packed23 = _mm_packs_epi32(quad2, quad3);
+            __m128i indices_bytes = _mm_packus_epi16(packed01, packed23);
+                        
+            // SIMD character lookup
+            __m128i mask_32 = _mm_cmplt_epi8(indices_bytes, const32);
+            __m128i lo_result = _mm_blendv_epi8(
+                _mm_shuffle_epi8(lut1, _mm_sub_epi8(indices_bytes, const16)),
+                _mm_shuffle_epi8(lut0, indices_bytes),
+                _mm_cmplt_epi8(indices_bytes, const16)
+            );
+            __m128i hi_result = _mm_blendv_epi8(
+                _mm_shuffle_epi8(lut3, _mm_sub_epi8(indices_bytes, const48)),
+                _mm_shuffle_epi8(lut2, _mm_sub_epi8(indices_bytes, const32)),
+                _mm_cmplt_epi8(indices_bytes, const48)
+            );
+            __m128i result = _mm_blendv_epi8(hi_result, lo_result, mask_32);
+            
+            // Use non-temporal stores for large outputs
+            if (data.size() >= 1024) {
+                _mm_stream_si128(reinterpret_cast<__m128i*>(dest + i * 4), result);
+            } else {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dest + i * 4), result);
+            }
+        }
+        
+        // Handle remaining 4 triplets with scalar
+        for (int i = 12; i < 16; ++i) {
+            uint32_t triple = (src[i*3] << 16) | (src[i*3+1] << 8) | src[i*3+2];
+            dest[i*4] = base64_chars[(triple >> 18) & 0x3f];
+            dest[i*4+1] = base64_chars[(triple >> 12) & 0x3f];
+            dest[i*4+2] = base64_chars[(triple >> 6) & 0x3f];
+            dest[i*4+3] = base64_chars[triple & 0x3f];
         }
         
         src += 48;
         dest += 64;
         len -= 48;
     }
-    
-    DEBUG_LOG("SIMD processed " + std::to_string(data.size() - len) + " bytes, " + std::to_string(len) + " remaining for scalar");
     
     // Scalar fallback for remaining bytes
     while (len >= 3) {
@@ -928,6 +1054,7 @@ static constexpr char base64_chars[64] = {
     }
     
     base64_buffer.resize(dest - dest_orig);
+    
     return base64_buffer;
 }
 #endif
@@ -949,20 +1076,38 @@ static constexpr char base64_chars[64] = {
     
     if (debug_enabled) {
         std::string input_hex;
-        for (size_t i = 0; i < std::min(size_t(32), data.size()); i++) {
+        for (size_t i = 0; i < data.size(); i++) {
             char buf[3];
             snprintf(buf, sizeof(buf), "%02x", data[i]);
             input_hex += buf;
         }
-        DEBUG_LOG("base64_encode input (" + std::to_string(data.size()) + " bytes, first 32): " + input_hex);
+        DEBUG_LOG("base64_encode input (" + std::to_string(data.size()) + " bytes): " + input_hex);
     }
     
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_BASE64_ENCODER)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER)
     // Use optimized SIMD path for larger inputs
     if (data.size() >= 48) {
         DEBUG_LOG("Using optimized base64 encode for " + std::to_string(data.size()) + " bytes");
-        std::string result = fast_avx2_base64_encode(data);
+        std::string result = fast_sse_base64_encode(data);
         DEBUG_LOG("Optimized base64 encode result: " + result);
+        
+        // Validate against OpenSSL reference implementation
+        if (debug_enabled) {
+            std::string openssl_buffer;
+            size_t out_len = ((data.size() + 2) / 3) * 4;
+            openssl_buffer.resize(out_len);
+            int actual_len = EVP_EncodeBlock(reinterpret_cast<uint8_t*>(openssl_buffer.data()), data.data(), data.size());
+            while (actual_len > 0 && openssl_buffer[actual_len - 1] == '=') {
+                actual_len--;
+            }
+            openssl_buffer.resize(actual_len);
+            DEBUG_LOG("OpenSSL reference result: " + openssl_buffer);
+            DEBUG_LOG("SIMD vs OpenSSL match: " + std::string(result == openssl_buffer ? "TRUE" : "FALSE"));
+            if (result != openssl_buffer) {
+                DEBUG_LOG("MISMATCH DETECTED - SIMD length: " + std::to_string(result.length()) + ", OpenSSL length: " + std::to_string(openssl_buffer.length()));
+            }
+        }
+        
         return result;
     }
 #endif
@@ -987,7 +1132,7 @@ static constexpr char base64_chars[64] = {
     DEBUG_LOG("base64_decode called with length " + std::to_string(encoded_string.size()) + ": '" + std::string(encoded_string) + "'");
     if (encoded_string.empty()) return {};
     
-    // Disable SIMD path temporarily to fix signature verification
+    // Use SIMD path for larger inputs
     if (encoded_string.size() >= 32) {
          DEBUG_LOG("Taking SIMD fast path");
          return fast_base64_decode_signature(encoded_string);
@@ -1033,12 +1178,12 @@ void serialize_canonical_fast(const json::value& v) {
             const auto& obj = v.as_object();
             bool first = true;
             
-            // boost::json::object is already ordered - no sorting needed!
+            // boost::json::object maintains key ordering
             for (const auto& kv : obj) {
                 if (!first) write_char(',');
                 first = false;
                 
-                // Fast string escaping
+                // Escape JSON string characters
                 write_char('"');
                 std::string_view key = kv.key();
                 for (char c : key) {
@@ -1110,7 +1255,7 @@ void serialize_canonical_fast(const json::value& v) {
             char buf[32];
             int len = fast_double_to_string(val, buf);
             
-            // .0 already added by fast_double_to_string
+            // Decimal point added by fast_double_to_string
             
             write_string(std::string_view(buf, len));
             break;
