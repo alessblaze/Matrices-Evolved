@@ -218,13 +218,14 @@ Running RUST implementation:
     synmark.suites.crypto_operations_auto: Mean +- std dev: 63.1 us +- 2.2 us  
 
 Running C++ implementation:
-    canonicalization: 0.62 μs per operation
-    base64_encoding: 1.12 μs per operation
-    base64_decoding: 1.96 μs per operation
-    content_hash: 0.86 μs per operation
-    json_signing: 15.95 μs per operation
-    signature_verification: 33.53 μs per operation
-    synmark.suites.crypto_operations_auto: Mean +- std dev: 53.7 us +- 1.9 us
+    canonicalization: 0.57 μs per operation
+    base64_encoding: 0.34 μs per operation
+    base64_decoding: 0.16 μs per operation
+    content_hash: 0.73 μs per operation
+    json_signing: 17.07 μs per operation
+    signature_verification: 36.30 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 53.6 us +- 2.0 us
+
 
 Stream Change Bench Results :
 Pure python:
