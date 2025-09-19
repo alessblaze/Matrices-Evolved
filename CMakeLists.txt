@@ -44,6 +44,17 @@ ExternalProject_Add(
   INSTALL_COMMAND ""
 )
 
+# SIMDE for portable SIMD
+ExternalProject_Add(
+  simde
+  GIT_REPOSITORY https://github.com/simd-everywhere/simde.git
+  GIT_TAG master
+  GIT_SHALLOW TRUE
+  CONFIGURE_COMMAND ""
+  BUILD_COMMAND ""
+  INSTALL_COMMAND ""
+)
+
 # AWS-LC for cryptography
 ExternalProject_Add(
   aws-lc
@@ -66,6 +77,8 @@ ExternalProject_Add(
 
 ExternalProject_Get_Property(boost SOURCE_DIR)
 set(BOOST_ROOT ${SOURCE_DIR})
+ExternalProject_Get_Property(simde SOURCE_DIR)
+set(SIMDE_ROOT ${SOURCE_DIR})
 ExternalProject_Get_Property(aws-lc SOURCE_DIR BINARY_DIR)
 set(AWS_LC_ROOT ${SOURCE_DIR})
 set(AWS_LC_BUILD ${BINARY_DIR})
@@ -81,9 +94,9 @@ set_target_properties(_event_signing_impl PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN TRUE
 )
-add_dependencies(_event_signing_impl boost aws-lc)
+add_dependencies(_event_signing_impl boost simde aws-lc)
 
-target_include_directories(_event_signing_impl PRIVATE ${BOOST_ROOT} ${AWS_LC_ROOT}/include)
+target_include_directories(_event_signing_impl PRIVATE ${BOOST_ROOT} ${SIMDE_ROOT} ${AWS_LC_ROOT}/include)
 target_link_libraries(_event_signing_impl PRIVATE 
     ${AWS_LC_BUILD}/crypto/libcrypto.a 
     ${BOOST_ROOT}/stage/lib/libboost_json.a
