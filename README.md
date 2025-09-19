@@ -217,14 +217,21 @@ Running RUST implementation:
     signature_verification: 36.82 μs per operation
     synmark.suites.crypto_operations_auto: Mean +- std dev: 63.1 us +- 2.2 us  
 
+Note: C++ uses Vecorization if enables so synthetic benchmarks like synmark spawn many processes
+usually in practice it would be faster due to continouous runs which reduces vecorization setup
+times. Mainly in smaller inputs vectorizations is not recomended but we can utilize the workload
+well in our scenatio, added private key caching improved the json signing but it is thread local
+matrix signing usually uses one single key to sign so caching a key helps for key object processing
+on openssl reduction on every call.
 Running C++ implementation:
-    canonicalization: 0.56 μs per operation
-    base64_encoding: 0.24 μs per operation
-    base64_decoding: 0.17 μs per operation
+    canonicalization: 0.60 μs per operation
+    base64_encoding: 0.25 μs per operation
+    base64_decoding: 0.16 μs per operation
     content_hash: 0.72 μs per operation
-    json_signing: 16.84 μs per operation
-    signature_verification: 34.71 μs per operation
-    synmark.suites.crypto_operations_auto: Mean +- std dev: 51.4 us +- 2.4 us
+    json_signing: 9.69 μs per operation
+    signature_verification: 35.68 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 46.5 us +- 1.3 us
+
     
 Stream Change Bench Results :
 Pure python:
