@@ -3,19 +3,14 @@
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * by the Free Software Foundation, version 3 of the License, or under
+ * alternative licensing terms as granted by Aless Microsystems.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Affero General Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * High-Performance Rust LRU Cache Implementation for Synapse
- * 
  * Features:
  * - O(1) cache operations (get, set, contains, len)
  * - O(k) hierarchy operations where k=tuple length (typically ≤4)
