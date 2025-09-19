@@ -18,11 +18,18 @@ use aws_lc_rs::{digest, signature};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde_json;
 use std::sync::LazyLock;
+use std::cell::RefCell;
 use pythonize::{pythonize, PythonizeError};
 use serde::{Deserialize, Serialize};
 
 // Cached debug flag for optimal performance
 static CRYPTO_DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("SYNAPSE_RUST_CRYPTO_DEBUG").unwrap_or_default() == "1");
+
+// Thread-local key cache to avoid repeated key pair creation
+thread_local! {
+    static CACHED_SIGNING_KEY: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+    static CACHED_KEY_PAIR: RefCell<Option<signature::Ed25519KeyPair>> = RefCell::new(None);
+}
 
 /// Verification result with automatic Python conversion
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,12 +122,14 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
 /// - Deterministic float representation using ryu
 /// - UTF-8 preservation in strings
 /// - Rejects non-finite floats
+#[inline(always)]
 fn canonicalize_json(value: &serde_json::Value) -> Result<String, String> {
     let mut result = String::with_capacity(estimate_json_size(value));
     canonicalize_json_into(&mut result, value)?;
     Ok(result)
 }
 
+#[inline(always)]
 fn canonicalize_json_into(result: &mut String, value: &serde_json::Value) -> Result<(), String> {
     match value {
         serde_json::Value::Null => result.push_str("null"),
@@ -199,13 +208,43 @@ pub fn sign_json_fast(
     json_bytes: Vec<u8>,
     signing_key_bytes: Vec<u8>
 ) -> PyResult<String> {
-    let key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
-        .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
+    // Validate key length first
+    if signing_key_bytes.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Invalid signing key length: expected 32 bytes, got {}", signing_key_bytes.len())
+        ));
+    }
     
-    let signature = key_pair.sign(&json_bytes);
-    let signature_b64 = STANDARD_NO_PAD.encode(signature.as_ref());
-    
-    Ok(signature_b64)
+    // Perform signing inside thread_local closure to avoid borrow checker issues
+    CACHED_SIGNING_KEY.with(|cached_key| {
+        CACHED_KEY_PAIR.with(|cached_pair| {
+            let mut cached_key = cached_key.borrow_mut();
+            let mut cached_pair = cached_pair.borrow_mut();
+            
+            // Check if we have a cached key pair for this key
+            if cached_key.as_ref() != Some(&signing_key_bytes) || cached_pair.is_none() {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache miss - creating new Ed25519KeyPair");
+                }
+                // Create new key pair and cache it
+                let new_key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
+                    .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
+                
+                *cached_key = Some(signing_key_bytes);
+                *cached_pair = Some(new_key_pair);
+            } else {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache hit - reusing cached Ed25519KeyPair");
+                }
+            }
+            
+            // Sign with cached key pair
+            let signature = cached_pair.as_ref().unwrap().sign(&json_bytes);
+            let signature_b64 = STANDARD_NO_PAD.encode(signature.as_ref());
+            
+            Ok(signature_b64)
+        })
+    })
 }
 
 #[pyfunction]
@@ -215,11 +254,38 @@ pub fn sign_json_with_info(
     signing_key_bytes: Vec<u8>,
     version: String
 ) -> PyResult<PyObject> {
-    let key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
-        .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
+    // Validate key length first
+    if signing_key_bytes.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Invalid signing key length: expected 32 bytes, got {}", signing_key_bytes.len())
+        ));
+    }
     
-    let signature = key_pair.sign(&json_bytes);
-    let signature_b64 = STANDARD_NO_PAD.encode(signature.as_ref());
+    // Perform signing inside thread_local closure
+    let signature_b64: String = CACHED_SIGNING_KEY.with(|cached_key| {
+        CACHED_KEY_PAIR.with(|cached_pair| -> PyResult<String> {
+            let mut cached_key = cached_key.borrow_mut();
+            let mut cached_pair = cached_pair.borrow_mut();
+            
+            if cached_key.as_ref() != Some(&signing_key_bytes) || cached_pair.is_none() {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache miss in sign_json_with_info - creating new Ed25519KeyPair");
+                }
+                let new_key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
+                    .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
+                
+                *cached_key = Some(signing_key_bytes);
+                *cached_pair = Some(new_key_pair);
+            } else {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache hit in sign_json_with_info - reusing cached Ed25519KeyPair");
+                }
+            }
+            
+            let signature = cached_pair.as_ref().unwrap().sign(&json_bytes);
+            Ok(STANDARD_NO_PAD.encode(signature.as_ref()))
+        })
+    })?;
     
     let result = SigningResult {
         signature: signature_b64,
@@ -240,6 +306,13 @@ pub fn sign_json_object_fast(
     signing_key_bytes: Vec<u8>,
     key_id: String
 ) -> PyResult<PyObject> {
+    // Validate key length first
+    if signing_key_bytes.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Invalid signing key length: expected 32 bytes, got {}", signing_key_bytes.len())
+        ));
+    }
+    
     // Convert PyDict to serde_json::Value
     let mut json_value: serde_json::Value = pythonize::depythonize(json_dict)
         .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Failed to convert Python dict"))?;
@@ -254,12 +327,31 @@ pub fn sign_json_object_fast(
     }
         .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("JSON canonicalization failed"))?;
     
-    // Sign the canonical JSON
-    let key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
-        .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
-    
-    let signature = key_pair.sign(canonical_json.as_bytes());
-    let signature_b64 = STANDARD_NO_PAD.encode(signature.as_ref());
+    // Sign using cached key pair
+    let signature_b64: String = CACHED_SIGNING_KEY.with(|cached_key| {
+        CACHED_KEY_PAIR.with(|cached_pair| -> PyResult<String> {
+            let mut cached_key = cached_key.borrow_mut();
+            let mut cached_pair = cached_pair.borrow_mut();
+            
+            if cached_key.as_ref() != Some(&signing_key_bytes) || cached_pair.is_none() {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache miss in sign_json_object_fast - creating new Ed25519KeyPair");
+                }
+                let new_key_pair = signature::Ed25519KeyPair::from_seed_unchecked(&signing_key_bytes)
+                    .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid signing key"))?;
+                
+                *cached_key = Some(signing_key_bytes);
+                *cached_pair = Some(new_key_pair);
+            } else {
+                if *CRYPTO_DEBUG_ENABLED {
+                    println!("DEBUG Rust crypto: Key cache hit in sign_json_object_fast - reusing cached Ed25519KeyPair");
+                }
+            }
+            
+            let signature = cached_pair.as_ref().unwrap().sign(canonical_json.as_bytes());
+            Ok(STANDARD_NO_PAD.encode(signature.as_ref()))
+        })
+    })?;
     
     // Add signature to JSON object
     if let Some(obj) = json_value.as_object_mut() {
@@ -435,6 +527,10 @@ pub fn sign_json(py: Python, json_object: &Bound<'_, PyDict>, signature_name: St
     let key_encode_method = signing_key.getattr(py, "encode")?;
     let encoded_key = key_encode_method.call0(py)?;
     let signing_key_bytes = encoded_key.extract::<Vec<u8>>(py)?;
+    
+    if *CRYPTO_DEBUG_ENABLED {
+        println!("DEBUG Rust crypto: sign_json called with key_id: {}", key_id);
+    }
     
     // Do everything in Rust - avoid Python update() call
     sign_json_object_fast(py, json_object, signature_name, signing_key_bytes, key_id)

@@ -1831,8 +1831,10 @@ inline std::string sign_json_fast(std::span<const uint8_t> json_bytes, const std
         // Check cache first
         EVP_PKEY* pkey = nullptr;
         if (cached_signing_key == signing_key_bytes && cached_signing_pkey) {
+            DEBUG_LOG("Key cache hit - reusing cached EVP_PKEY");
             pkey = cached_signing_pkey;
         } else {
+            DEBUG_LOG("Key cache miss - creating new EVP_PKEY");
             // Clear old cache
             if (cached_signing_pkey) {
                 EVP_PKEY_free(cached_signing_pkey);

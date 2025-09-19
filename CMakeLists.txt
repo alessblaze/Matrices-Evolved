@@ -304,12 +304,21 @@ if(BUILD_RUST)
     set(RUST_OUTPUT_FILE ${RUST_TARGET_DIR}/release/libmatrices_evolved_rust.so)
     set(RUST_DEST_FILE ${CMAKE_CURRENT_BINARY_DIR}/matrices_evolved_rust.so)
     
+    # Collect all Rust source files for dependency tracking
+    file(GLOB_RECURSE RUST_SOURCES 
+        ${CMAKE_CURRENT_SOURCE_DIR}/rust/src/*.rs
+        ${CMAKE_CURRENT_SOURCE_DIR}/rust/crypto/*.rs
+        ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
+        ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.lock
+    )
+    
     add_custom_command(
         OUTPUT ${RUST_OUTPUT_FILE}
         COMMAND ${CMAKE_COMMAND} -E env 
             CARGO_TARGET_DIR=${RUST_TARGET_DIR}
             ${CARGO_EXECUTABLE} build --release --manifest-path=${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/rust
+        DEPENDS ${RUST_SOURCES}
         COMMENT "Building Rust PyO3 module"
     )
     

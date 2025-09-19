@@ -198,7 +198,8 @@ Pure rust bench:
       2 (2.00%) high severe
 
 Synmark bench Crypto:
-Note: C++ uses an iterative approach to json structure walk, Rust uses recursion.
+Note: Python code probably has no keycaching as we did not write these functions. they are directly tested
+against synapse provided functions.
 Running PYTHON implementation:
     canonicalization: 1.99 μs per operation
     base64_encoding: 0.68 μs per operation
@@ -207,15 +208,16 @@ Running PYTHON implementation:
     json_signing: 19.75 μs per operation
     signature_verification: 48.15 μs per operation
     synmark.suites.crypto_operations_auto: Mean +- std dev: 73.0 us +- 1.5 us
-
+Note: Now Rust implementation also uses keycaching but the vectorization is not done manually thus
+the mean result may be a bit misleading in real life scenarios.
 Running RUST implementation:
-    canonicalization: 1.45 μs per operation
-    base64_encoding: 4.66 μs per operation
-    base64_decoding: 0.36 μs per operation
-    content_hash: 1.42 μs per operation
-    json_signing: 18.18 μs per operation
-    signature_verification: 36.82 μs per operation
-    synmark.suites.crypto_operations_auto: Mean +- std dev: 63.1 us +- 2.2 us  
+    canonicalization: 0.99 μs per operation
+    base64_encoding: 4.74 μs per operation
+    base64_decoding: 0.38 μs per operation
+    content_hash: 0.99 μs per operation
+    json_signing: 10.99 μs per operation
+    signature_verification: 36.73 μs per operation
+    synmark.suites.crypto_operations_auto: Mean +- std dev: 55.3 us +- 0.3 us
 
 Note: C++ uses Vecorization if enables so synthetic benchmarks like synmark spawn many processes
 usually in practice it would be faster due to continouous runs which reduces vecorization setup
@@ -223,6 +225,7 @@ times. Mainly in smaller inputs vectorizations is not recomended but we can util
 well in our scenatio, added private key caching improved the json signing but it is thread local
 matrix signing usually uses one single key to sign so caching a key helps for key object processing
 on openssl reduction on every call.
+Note: C++ uses an iterative approach to json structure walk, Rust uses recursion.
 Running C++ implementation:
     canonicalization: 0.60 μs per operation
     base64_encoding: 0.25 μs per operation
