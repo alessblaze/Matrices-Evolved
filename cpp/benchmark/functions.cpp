@@ -217,6 +217,40 @@ static inline __m256i extract_indices_to_bytes_avx2(const __m256i& packed) {
     
     return _mm256_or_si256(_mm256_or_si256(idx0, idx1), _mm256_or_si256(idx2, idx3));
 }
+static inline __m256i lut_lookup_avx(const __m256i& indices) {
+    static const __m256i lut0 = _mm256_setr_epi8(
+        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
+        'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P'
+    );
+    static const __m256i lut1 = _mm256_setr_epi8(
+        'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
+        'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f'
+    );
+    static const __m256i lut2 = _mm256_setr_epi8(
+        'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v',
+        'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v'
+    );
+    static const __m256i lut3 = _mm256_setr_epi8(
+        'w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/',
+        'w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/'
+    );
+    static const __m256i const16 = _mm256_set1_epi8(16);
+    static const __m256i const32 = _mm256_set1_epi8(32);
+    static const __m256i const48 = _mm256_set1_epi8(48);
+    
+    __m256i mask_32 = _mm256_cmpgt_epi8(const32, indices);
+    __m256i lo_result = _mm256_blendv_epi8(
+        _mm256_shuffle_epi8(lut1, _mm256_sub_epi8(indices, const16)),
+        _mm256_shuffle_epi8(lut0, indices),
+        _mm256_cmpgt_epi8(const16, indices)
+    );
+    __m256i hi_result = _mm256_blendv_epi8(
+        _mm256_shuffle_epi8(lut3, _mm256_sub_epi8(indices, const48)),
+        _mm256_shuffle_epi8(lut2, _mm256_sub_epi8(indices, const32)),
+        _mm256_cmpgt_epi8(const48, indices)
+    );
+    return _mm256_blendv_epi8(hi_result, lo_result, mask_32);
+}
 
 // Register-based LUT approach - load all characters into registers
 static inline __m256i lut_lookup_avx2(const __m256i& indices) {
@@ -251,6 +285,47 @@ static inline __m256i lut_lookup_avx2(const __m256i& indices) {
     
     return result;
 }
+
+static inline __m256i sel_by_mask_xor(__m256i a, __m256i b, __m256i m) {
+    __m256i diff = _mm256_xor_si256(a, b);              // a ^ b
+    __m256i take = _mm256_and_si256(diff, m);           // (a ^ b) & m
+    return _mm256_xor_si256(a, take);                   // a ^ ...
+}
+
+static inline __m256i sel_by_mask_andn(__m256i a, __m256i b, __m256i m) {
+    __m256i a_keep = _mm256_andnot_si256(m, a);         // (~m) & a
+    __m256i b_take = _mm256_and_si256(m, b);            // m & b
+    return _mm256_or_si256(a_keep, b_take);             // (a&~m) | (b&m)
+}
+
+static inline __m256i lut_lookup_avx2_selects(__m256i idx) {
+    const __m256i A  = _mm256_set1_epi8('A');
+    const __m256i aM = _mm256_set1_epi8('a' - 26);
+    const __m256i dM = _mm256_set1_epi8('0' - 52);
+    const __m256i p  = _mm256_set1_epi8('+');
+    const __m256i s  = _mm256_set1_epi8('/');
+    const __m256i c26= _mm256_set1_epi8(26);
+    const __m256i c52= _mm256_set1_epi8(52);
+    const __m256i c62= _mm256_set1_epi8(62);
+
+    __m256i lt26 = _mm256_cmpgt_epi8(c26, idx);      // idx < 26
+    __m256i lt52 = _mm256_cmpgt_epi8(c52, idx);      // idx < 52
+    __m256i lt62 = _mm256_cmpgt_epi8(c62, idx);      // idx < 62
+    __m256i eq62 = _mm256_cmpeq_epi8(idx, c62);      // idx == 62
+
+    __m256i AZ = _mm256_add_epi8(A,  idx);           // 'A'+i
+    __m256i az = _mm256_add_epi8(aM, idx);           // 'a'+(i-26)
+    __m256i dg = _mm256_add_epi8(dM, idx);           // '0'+(i-52)
+
+    __m256i r = s;                                   // default '/'
+    r = sel_by_mask_xor(r, dg, lt62);                // 0..61 → digits
+    r = sel_by_mask_xor(r, az, lt52);                // 0..51 → a..z
+    r = sel_by_mask_xor(r, AZ, lt26);                // 0..25 → A..Z
+    r = sel_by_mask_xor(r, p,  eq62);                // 62 → '+'
+    return r;
+}
+
+
 
 // AVX2 base64 chunk processor using permute operations
 static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
@@ -291,7 +366,7 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     __m256i idx3 = _mm256_slli_epi32(_mm256_and_si256(packed, mask6), 24);
     __m256i indices_vec = _mm256_or_si256(_mm256_or_si256(idx0, idx1), _mm256_or_si256(idx2, idx3));
     
-    return lut_lookup_avx2(indices_vec);
+    return lut_lookup_avx2_selects(indices_vec);
 }
 
 [[gnu::hot, gnu::flatten]] inline std::string fast_sse_base64_encode_avx(const std::vector<uint8_t>& data) {
