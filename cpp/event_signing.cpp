@@ -1518,6 +1518,103 @@ static inline __m256i lut_lookup_avx2_selects(__m256i idx) {
     return r;
 }
 
+static inline __m256i map_base64_1pshufb(__m256i idx) {
+    // Classify indices into 4 classes: 0:[0..25], 1:[26..51], 2:[52..61], 3:[62..63]
+    __m256i gt25 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(25));
+    __m256i gt51 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(51));
+    __m256i gt61 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(61));
+    __m256i one  = _mm256_set1_epi8(1);
+    __m256i cls  = _mm256_add_epi8(_mm256_and_si256(gt25, one),
+                    _mm256_add_epi8(_mm256_and_si256(gt51, one),
+                                    _mm256_and_si256(gt61, one)));
+
+    // Build 16-byte LUT and broadcast to 256 bits (both lanes get the same 16B)
+    const __m128i lut128 = _mm_setr_epi8(
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0,
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0
+    );
+    const __m256i lut = _mm256_broadcastsi128_si256(lut128);
+
+    // One VPSHUFB: fetch ASCII deltas by class; MSB of cls is 0 so no zeroing
+    __m256i delta = _mm256_shuffle_epi8(lut, cls);
+
+    // Apply delta to indices (maps 0..25→'A'+i, 26..51→'a'+i-26, 52..61→'0'+i-52)
+    __m256i out = _mm256_add_epi8(idx, delta);
+
+    // Patch specials: 62 -> '+', 63 -> '/'
+    __m256i eq62  = _mm256_cmpeq_epi8(idx, _mm256_set1_epi8(62));
+    __m256i eq63  = _mm256_cmpeq_epi8(idx, _mm256_set1_epi8(63));
+    __m256i plus  = _mm256_set1_epi8('+');
+    __m256i slash = _mm256_set1_epi8('/');
+
+    out = sel_by_mask_xor(out, plus,  eq62);
+    out = sel_by_mask_xor(out, slash, eq63);
+    return out;
+}
+
+static inline __m256i map_base64_1pshufb_32(__m256i idx) {
+    // Classify indices into 4 classes: 0:[0..25], 1:[26..51], 2:[52..61], 3:[62..63]
+    __m256i gt25 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(25));
+    __m256i gt51 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(51));
+    __m256i gt61 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(61));
+    __m256i one  = _mm256_set1_epi8(1);
+    __m256i cls  = _mm256_add_epi8(_mm256_and_si256(gt25, one),
+                    _mm256_add_epi8(_mm256_and_si256(gt51, one),
+                                    _mm256_and_si256(gt61, one)));
+
+    // 32-arg LUT: duplicate the 16-byte pattern in both lanes (VPSHUFB is lane-local)
+    const __m256i lut = _mm256_setr_epi8(
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0,
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0,
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0,
+        65, 71, (char)-4, 0, 65, 71, (char)-4, 0
+    );
+
+    // One VPSHUFB: fetch ASCII deltas by class (class codes 0..3 keep MSB clear -> no zeroing)
+    __m256i delta = _mm256_shuffle_epi8(lut, cls);
+
+    // Apply delta to indices
+    __m256i out = _mm256_add_epi8(idx, delta);
+
+    // Patch specials: 62 -> '+', 63 -> '/'
+    __m256i eq62  = _mm256_cmpeq_epi8(idx, _mm256_set1_epi8(62));
+    __m256i eq63  = _mm256_cmpeq_epi8(idx, _mm256_set1_epi8(63));
+    __m256i plus  = _mm256_set1_epi8('+');
+    __m256i slash = _mm256_set1_epi8('/');
+
+    out = sel_by_mask_xor(out, plus,  eq62);
+    out = sel_by_mask_xor(out, slash, eq63);
+    return out;
+}
+
+static inline __m256i map_base64_1pshufb_merged(__m256i idx) {
+    __m256i gt25 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(25));
+    __m256i gt51 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(51));
+    __m256i gt61 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(61));
+    __m256i one  = _mm256_set1_epi8(1);
+    __m256i cls  = _mm256_add_epi8(_mm256_and_si256(gt25, one),
+                    _mm256_add_epi8(_mm256_and_si256(gt51, one),
+                                    _mm256_and_si256(gt61, one)));
+
+    // LUT deltas by class: 0:+65 ('A'), 1:+71 ('a'-26), 2:-4 ('0'-52), 3:-19 (base for '+'/'/')
+    const __m256i lut = _mm256_setr_epi8(
+        65, 71, (char)-4, (char)-19, 65, 71, (char)-4, (char)-19,
+        65, 71, (char)-4, (char)-19, 65, 71, (char)-4, (char)-19,
+        65, 71, (char)-4, (char)-19, 65, 71, (char)-4, (char)-19,
+        65, 71, (char)-4, (char)-19, 65, 71, (char)-4, (char)-19
+    );
+    __m256i delta = _mm256_shuffle_epi8(lut, cls);
+
+    // Compute s3 = 3*(idx&1) only for idx>=62: adds 0 for 62, 3 for 63
+    __m256i lsb  = _mm256_and_si256(idx, one);
+    __m256i s3   = _mm256_add_epi8(lsb, _mm256_add_epi8(lsb, lsb));   // 3*lsb
+    s3 = _mm256_and_si256(s3, gt61);
+
+    // Final ASCII
+    return _mm256_add_epi8(_mm256_add_epi8(idx, delta), s3);
+}
+
+
 
 // AVX2 4-LUT lookup approach matching SSE version
 static inline __m256i lut_lookup_avx2(const __m256i& indices) {
@@ -1594,7 +1691,8 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     __m256i idx3 = _mm256_slli_epi32(_mm256_and_si256(packed, mask6), 24);
     __m256i indices_vec = _mm256_or_si256(_mm256_or_si256(idx0, idx1), _mm256_or_si256(idx2, idx3));
     
-    return lut_lookup_avx2_selects(indices_vec);
+    //return lut_lookup_avx2_selects(indices_vec);
+    return map_base64_1pshufb_merged(indices_vec);
 }
 
 [[gnu::hot, gnu::flatten]] inline std::string fast_sse_base64_encode_avx(const std::vector<uint8_t>& data) {
