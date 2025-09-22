@@ -2385,8 +2385,8 @@ namespace base64 {
 [[gnu::hot, gnu::flatten]] inline std::string base64_encode(const std::vector<uint8_t>& data) {
     if (data.empty()) return "";
     
-//#if 0
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_AVX)
+#if 0
+//#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_AVX)
     // Always test AVX2 encoder with 96-byte hardcoded data first
     static const std::vector<uint8_t> test_data_96 = {
         0xdd,0x01,0xef,0xec,0x9b,0xec,0xfe,0x29,0x0d,0xc3,0x9e,0xfb,0x22,0xd3,0xda,0xf0,
