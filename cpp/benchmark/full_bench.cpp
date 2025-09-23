@@ -180,12 +180,13 @@ int main() {
     std::map<std::string, std::vector<double>> overall_times;
     
     std::vector<std::string> function_names = {
-        "OpenSSL", "SSE", "Mulla SSE", "SSE Aligned", "AVX2 Lemire", "AVX2 Custom"
+        "OpenSSL", "AMS SSE", "Mulla SSE", "AMS SSE Aligned", "AVX2 Lemire", "AMS AVX2 Custom", "AMS NEON"
     };
     
     std::vector<std::function<std::string(const std::vector<uint8_t>&)>> functions = {
         openssl_base64_encode, fast_sse_base64_encode, fast_mula_base64_encode,
-        fast_sse_base64_encode_aligned, fast_avx2_base64_encode_lemire, fast_sse_base64_encode_avx
+        fast_sse_base64_encode_aligned, fast_avx2_base64_encode_lemire, fast_sse_base64_encode_avx,
+        fast_neon_base64_encode
     };
     
     for (const auto& config : test_configs) {
