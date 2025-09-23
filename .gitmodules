@@ -1,0 +1,3 @@
+[submodule "cpp/benchmark/simde"]
+	path = cpp/benchmark/simde
+	url = https://github.com/simd-everywhere/simde.git
