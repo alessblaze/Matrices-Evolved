@@ -134,19 +134,31 @@ pip install -e . -C cmake.define.BUILD_RUST=ON
 ```
 matrices_evolved/
 ├── cpp/                    # C++ nanobind implementation
-│   └── event_signing.cpp
-├── rust/                   # Rust PyO3 implementation
+│   ├── base64/            # SIMD-optimized base64 encoders/decoders
+│   │   ├── encoders/      # Multiple encoder implementations
+│   │   └── decoders/      # Multiple decoder implementations
+│   ├── benchmark/         # Performance benchmarking suite
+│   │   ├── simde/         # SIMD Everywhere submodule
+│   │   └── full_bench.cpp # Comprehensive benchmarks
+│   ├── crypto/            # Ed25519 cryptographic operations
+│   │   └── ed25519.cpp    # Digital signatures & key management
+│   ├── json/              # JSON canonicalization
+│   │   └── canonicalization.cpp # SIMD-optimized JSON processing
+│   ├── debug.h            # Debug infrastructure & shared definitions
+│   ├── global.h           # Global includes & nanobind setup
+│   └── lib.cpp            # Python bindings & module definition
+├── rust/                  # Rust PyO3 implementation
 │   ├── crypto/
-│   │   ├── event_signing.rs
-│   │   ├── cache.rs
-│   │   └── stream_change_cache.rs
+│   │   ├── event_signing.rs # Ed25519 operations
+│   │   ├── cache.rs       # LRU cache implementation
+│   │   └── stream_change_cache.rs # Stream change tracking
 │   ├── Cargo.toml
 │   └── lib.rs
-├── matrices_evolved/       # Python package
-│   ├── __init__.py        # Auto-selection logic
-│   ├── cpp.py             # C++ wrapper
-│   └── rust.py            # Rust wrapper
-└── CMakeLists.txt         # Build configuration
+├── matrices_evolved/      # Python package
+│   ├── __init__.py       # Auto-selection logic
+│   ├── cpp.py            # C++ wrapper
+│   └── rust.py           # Rust wrapper
+└── CMakeLists.txt        # Build configuration
 ```
 ## In Progress
 

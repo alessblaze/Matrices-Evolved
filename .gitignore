@@ -1,6 +1,7 @@
 # Build directories
 build/
 dist/
+wheelhouse/
 *.egg-info/
 
 # Python cache
@@ -38,6 +39,7 @@ rust/Cargo.lock
 *.dll
 *.dylib
 *.a
+cpp/benchmark/full_bench
 
 # CMake
 CMakeCache.txt

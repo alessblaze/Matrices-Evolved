@@ -1,0 +1,9 @@
+include CMakeLists.txt
+include LICENSE
+include README.md
+include API.md
+include BUILD.md
+include requirements.txt
+recursive-include cpp *.cpp *.h *.hpp
+recursive-include rust *.rs *.toml *.lock
+include .cargo/config.toml

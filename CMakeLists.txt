@@ -10,6 +10,18 @@ project(matrices_evolved LANGUAGES CXX)
 option(BUILD_RUST "Build Rust PyO3 implementation" ON)
 option(BUILD_CPP "Build C++ nanobind implementation" ON)
 
+# Force clean build on macro changes
+set(MACRO_HASH "aligned_enabled")
+set(HASH_FILE "${CMAKE_BINARY_DIR}/macro_hash.txt")
+if(EXISTS "${HASH_FILE}")
+    file(READ "${HASH_FILE}" OLD_HASH)
+    if(NOT "${OLD_HASH}" STREQUAL "${MACRO_HASH}")
+        message(STATUS "Macro configuration changed, cleaning build")
+        file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/CMakeFiles/_event_signing_impl.dir")
+    endif()
+endif()
+file(WRITE "${HASH_FILE}" "${MACRO_HASH}")
+
 # Compiler information
 message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
 message(STATUS "CXX Compiler: ${CMAKE_CXX_COMPILER}")
@@ -34,13 +46,15 @@ find_package(nanobind CONFIG REQUIRED PATHS ${nanobind_ROOT})
 # Download and build dependencies
 include(ExternalProject)
 
-# Boost.JSON
+# Boost.JSON 
+# its header only but this is kept for compatibility with the existing CMake structure
 ExternalProject_Add(
   boost
   URL https://archives.boost.io/release/1.89.0/source/boost_1_89_0.tar.gz
   CONFIGURE_COMMAND ./bootstrap.sh --with-libraries=json --with-toolset=clang-20
   BUILD_COMMAND rm project-config.jam && ./b2 toolset=clang-20 --with-json variant=release link=static cxxflags=-fPIC -O3 -static
   BUILD_IN_SOURCE 1
+  BUILD_BYPRODUCTS <SOURCE_DIR>/stage/lib/libboost_json.a
   INSTALL_COMMAND ""
 )
 
@@ -61,6 +75,7 @@ ExternalProject_Add(
   GIT_REPOSITORY https://github.com/aws/aws-lc.git
   GIT_TAG main
   GIT_SHALLOW TRUE
+  CMAKE_GENERATOR "Unix Makefiles"
   CMAKE_ARGS 
     -DCMAKE_BUILD_TYPE=Release 
     -DBUILD_SHARED_LIBS=OFF 
@@ -72,6 +87,7 @@ ExternalProject_Add(
     -DDISABLE_PERL=ON
     -DDISABLE_GO=ON
     -DBUILD_TESTING=OFF
+  BUILD_BYPRODUCTS <BINARY_DIR>/crypto/libcrypto.a
   INSTALL_COMMAND ""
 )
 
@@ -88,20 +104,52 @@ message(STATUS "AWS-LC source: ${AWS_LC_ROOT}")
 message(STATUS "AWS-LC build: ${AWS_LC_BUILD}")
 message(STATUS "AWS-LC crypto lib: ${AWS_LC_BUILD}/crypto/libcrypto.a")
 
-nanobind_add_module(_event_signing_impl STABLE_ABI NOMINSIZE LTO cpp/event_signing.cpp)
+# Source files for the C++ implementation
+set(CPP_SOURCES
+    cpp/lib.cpp
+    cpp/json/canonicalization.cpp
+    cpp/crypto/ed25519.cpp
+)
+
+# Add all .cpp files from encoders and decoders
+file(GLOB_RECURSE ENCODER_SOURCES "cpp/base64/encoders/*.cpp")
+file(GLOB_RECURSE DECODER_SOURCES "cpp/base64/decoders/*.cpp")
+list(APPEND CPP_SOURCES ${ENCODER_SOURCES} ${DECODER_SOURCES})
+
+# Add header dependencies to force recompilation when headers change
+set(CPP_HEADERS
+    cpp/global.h
+    cpp/json/canonicalization.h
+    cpp/crypto/ed25519.h
+)
+
+# Add all .h files from encoders and decoders
+file(GLOB_RECURSE ENCODER_HEADERS "cpp/base64/encoders/*.h")
+file(GLOB_RECURSE DECODER_HEADERS "cpp/base64/decoders/*.h")
+list(APPEND CPP_HEADERS ${ENCODER_HEADERS} ${DECODER_HEADERS})
+
+nanobind_add_module(_event_signing_impl STABLE_ABI NOMINSIZE LTO ${CPP_SOURCES} ${CPP_HEADERS})
 set_target_properties(_event_signing_impl PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION TRUE
     CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN TRUE
+    VISIBILITY_INLINES_HIDDEN FALSE
 )
 add_dependencies(_event_signing_impl boost simde aws-lc)
 
 target_include_directories(_event_signing_impl PRIVATE ${BOOST_ROOT} ${SIMDE_ROOT} ${AWS_LC_ROOT}/include)
-target_link_libraries(_event_signing_impl PRIVATE 
-    ${AWS_LC_BUILD}/crypto/libcrypto.a 
-    ${BOOST_ROOT}/stage/lib/libboost_json.a
-)
+
+# Create imported targets for external libraries
+add_library(aws_lc_crypto STATIC IMPORTED)
+set_target_properties(aws_lc_crypto PROPERTIES IMPORTED_LOCATION ${AWS_LC_BUILD}/crypto/libcrypto.a)
+add_dependencies(aws_lc_crypto aws-lc)
+# kept for compatibility with existing CMake structure or if we add something in future
+add_library(boost_json STATIC IMPORTED)
+set_target_properties(boost_json PROPERTIES IMPORTED_LOCATION ${BOOST_ROOT}/stage/lib/libboost_json.a)
+add_dependencies(boost_json boost)
+
+target_link_libraries(_event_signing_impl PRIVATE aws_lc_crypto boost_json)
 target_link_options(_event_signing_impl PRIVATE -fuse-ld=lld-20)
+set_target_properties(_event_signing_impl PROPERTIES LINK_FLAGS "-fuse-ld=lld-20")
 target_compile_options(_event_signing_impl PRIVATE -fPIC)
 target_compile_features(_event_signing_impl PRIVATE cxx_std_23)
 
@@ -143,9 +191,9 @@ function(apply_optimizations target)
     message(STATUS "Compiler ID: ${CMAKE_CXX_COMPILER_ID}")
     message(STATUS "Compiler Version: ${CMAKE_CXX_COMPILER_VERSION}")
     
-    # Base optimization flags
+    # Base optimization flags -march=native -mtune=native
     target_compile_options(${target} PRIVATE
-        -O3 -ffast-math -march=native -mtune=native
+        -O3 -ffast-math 
         -funroll-loops -fomit-frame-pointer
         -fno-stack-protector
         -funsafe-math-optimizations
