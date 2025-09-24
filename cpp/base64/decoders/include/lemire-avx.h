@@ -13,12 +13,16 @@
  */
 
 #pragma once
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_LEMIRE)
 
 #include <vector>
-#include <string>
+#include <string_view>
 #include <cstdint>
-#include "../../../global.h"
-extern thread_local std::string base64_buffer;
-[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_avx2_base64_encode_lemire(const std::vector<uint8_t>& data);
-#endif
+
+/**
+ * High-performance AVX2-optimized base64 decoder for cryptographic signatures
+ * @param input Base64 encoded string to decode
+ * @return Decoded binary data optimized for signature verification
+ */
+extern thread_local std::vector<uint8_t> decode_buffer;
+
+[[gnu::hot, gnu::flatten]] std::vector<uint8_t> fast_base64_decode_signature(std::string_view input);

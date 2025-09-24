@@ -160,7 +160,7 @@ namespace base64 {
  * @param data Input byte vector to encode
  * @return Base64 encoded string (unpadded)
  */
-[[gnu::hot, gnu::flatten]] std::string fast_mula_base64_encode(const std::vector<uint8_t>& data) {
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_mula_base64_encode(const std::vector<uint8_t>& data) {
     size_t len = data.size();
     
     // Fast path for tiny inputs

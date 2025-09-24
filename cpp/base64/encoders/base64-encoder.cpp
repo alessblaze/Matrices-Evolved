@@ -1,16 +1,22 @@
 /*
- * Copyright (C) 2025 Aless Microsystems
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, version 3 of the License, or under
- * alternative licensing terms as granted by Aless Microsystems.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- */
+
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
 
 // Validation: These are DISABLE flags, so we need at least 5 defined to have only 1 implementation enabled
 #include "include/base64-encoder.h"
@@ -52,7 +58,7 @@ thread_local std::string encoder_base64_buffer;
  * @param data Binary data to encode
  * @return Unpadded base64 encoded string (Matrix compatible)
  */
-std::string base64_encode(const std::vector<uint8_t>& data) {
+[[clang::always_inline]] std::string base64_encode(const std::vector<uint8_t>& data) {
     if (data.empty()) return "";
     
 #if 0
@@ -99,7 +105,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
     }
 #endif
     
-    if (is_debug_enabled()) {
+    if (debug_enabled) {
         std::string input_hex;
         input_hex.reserve(data.size() * 2);
         for (size_t i = 0; i < data.size(); i++) {
@@ -118,7 +124,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
         DEBUG_LOG("AVX2 base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);
@@ -144,7 +150,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
         DEBUG_LOG("Unaligned base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);
@@ -170,7 +176,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
         DEBUG_LOG("NEON base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);
@@ -196,7 +202,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
         DEBUG_LOG("Lemire AVX2 base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);
@@ -222,7 +228,7 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
         DEBUG_LOG("Mula SSE base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);
@@ -244,11 +250,11 @@ std::string base64_encode(const std::vector<uint8_t>& data) {
     // Use aligned SIMD path for larger inputs
     if (data.size() >= 48) {
         DEBUG_LOG("Using aligned base64 encode for " + std::to_string(data.size()) + " bytes");
-        std::string result = fast_sse_base64_encode_aligned(data);
+        std::string result = fast_sse_base64_encode_aligned_alt(data);
         DEBUG_LOG("Optimized base64 encode result: " + result);
         
         // Validate against OpenSSL reference implementation
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string openssl_buffer;
             size_t out_len = ((data.size() + 2) / 3) * 4;
             openssl_buffer.resize(out_len);

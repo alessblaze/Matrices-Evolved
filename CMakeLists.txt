@@ -131,7 +131,7 @@ list(APPEND CPP_HEADERS ${ENCODER_HEADERS} ${DECODER_HEADERS})
 nanobind_add_module(_event_signing_impl STABLE_ABI NOMINSIZE LTO ${CPP_SOURCES} ${CPP_HEADERS})
 set_target_properties(_event_signing_impl PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION TRUE
-    CXX_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN FALSE
 )
 add_dependencies(_event_signing_impl boost simde aws-lc)
@@ -191,9 +191,9 @@ function(apply_optimizations target)
     message(STATUS "Compiler ID: ${CMAKE_CXX_COMPILER_ID}")
     message(STATUS "Compiler Version: ${CMAKE_CXX_COMPILER_VERSION}")
     
-    # Base optimization flags -march=native -mtune=native
+    # Base optimization flags 
     target_compile_options(${target} PRIVATE
-        -O3 -ffast-math 
+        -O3 -ffast-math -march=native -mtune=native
         -funroll-loops -fomit-frame-pointer
         -fno-stack-protector
         -funsafe-math-optimizations

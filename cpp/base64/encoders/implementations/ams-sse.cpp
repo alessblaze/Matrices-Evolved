@@ -1,17 +1,22 @@
 /*
- * Copyright (C) 2025 Aless Microsystems
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, version 3 of the License, or under
- * alternative licensing terms as granted by Aless Microsystems.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- */
 
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
 #include "../include/ams-sse.h"
 
 #if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER)
@@ -36,7 +41,7 @@ static inline __m128i extract_indices_to_bytes_alt(const __m128i& packed) {
 }
 
 // Current optimized approach using single reusable mask
-static inline __m128i extract_indices_to_bytes(const __m128i& packed) {
+[[clang::always_inline]] static inline __m128i extract_indices_to_bytes(const __m128i& packed) {
     static const __m128i mask6 = _mm_set1_epi32(0x3f);
     __m128i idx0 = _mm_and_si128(_mm_srli_epi32(packed, 18), mask6);
     __m128i idx1 = _mm_slli_epi32(_mm_and_si128(_mm_srli_epi32(packed, 12), mask6), 8);
@@ -45,7 +50,7 @@ static inline __m128i extract_indices_to_bytes(const __m128i& packed) {
     return _mm_or_si128(_mm_or_si128(idx0, idx1), _mm_or_si128(idx2, idx3));
 }
 
-static inline __m128i lut_lookup(const __m128i& indices) {
+[[clang::always_inline]] static inline __m128i lut_lookup(const __m128i& indices) {
     static const __m128i lut0 = _mm_setr_epi8('A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P');
     static const __m128i lut1 = _mm_setr_epi8('Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f');
     static const __m128i lut2 = _mm_setr_epi8('g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v');
@@ -94,8 +99,8 @@ static inline __m128i lut_lookup(const __m128i& indices) {
  * @param data Input byte vector to encode
  * @return Base64 encoded string (unpadded for Matrix protocol)
  */
-[[gnu::hot, gnu::flatten]] std::string fast_sse_base64_encode(const std::vector<uint8_t>& data) {
-    if (is_debug_enabled()) {
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode(const std::vector<uint8_t>& data) {
+    if (debug_enabled) {
         DEBUG_LOG("fast_sse_base64_encode called with " + std::to_string(data.size()) + " bytes");
     }
     size_t len = data.size();
@@ -143,7 +148,7 @@ static inline __m128i lut_lookup(const __m128i& indices) {
 
     
     // Process 48-byte blocks with single loop
-    if (is_debug_enabled() && len >= 48) {
+    if (debug_enabled && len >= 48) {
         DEBUG_LOG("SSE encoder: processing " + std::to_string(len) + " bytes with SIMD");
     }
     while (len >= 48) {
@@ -216,7 +221,7 @@ static constexpr char base64_chars[64] = {
 };
 
 // NEON helper functions for base64 encoding
-static inline uint8x16_t extract_indices_to_bytes_neon(const uint32x4_t& packed) {
+[[clang::always_inline]] static inline uint8x16_t extract_indices_to_bytes_neon(const uint32x4_t& packed) {
     const uint32x4_t mask6 = vdupq_n_u32(0x3f);
     uint32x4_t idx0 = vandq_u32(vshrq_n_u32(packed, 18), mask6);
     uint32x4_t idx1 = vshlq_n_u32(vandq_u32(vshrq_n_u32(packed, 12), mask6), 8);
@@ -234,7 +239,7 @@ alignas(16) static const uint8_t b64_tbl_bytes[64] = {
 };
 
 // indices: 16 bytes, each in 0..63
-static inline uint8x16_t lut_lookup_neon64(uint8x16_t indices) {
+[[clang::always_inline]] static inline uint8x16_t lut_lookup_neon64(uint8x16_t indices) {
     // Build a 64-byte table in four q-registers once; compilers typically hoist this.
     uint8x16x4_t tbl;
     tbl.val[0] = vld1q_u8(b64_tbl_bytes +  0);
@@ -246,7 +251,7 @@ static inline uint8x16_t lut_lookup_neon64(uint8x16_t indices) {
     return vqtbl4q_u8(tbl, indices);
 }
 
-static inline uint8x16_t lut_lookup_neon(const uint8x16_t& indices) {
+[[clang::always_inline]] static inline uint8x16_t lut_lookup_neon(const uint8x16_t& indices) {
     // NEON lookup tables (16 bytes each)
     const uint8x16_t lut0 = {65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80}; // A-P
     const uint8x16_t lut1 = {81,82,83,84,85,86,87,88,89,90,97,98,99,100,101,102}; // Q-Z,a-f
@@ -286,7 +291,7 @@ static inline uint8x16_t lut_lookup_neon(const uint8x16_t& indices) {
  * @param data Input byte vector to encode
  * @return Base64 encoded string (unpadded for Matrix protocol)
  */
-[[gnu::hot, gnu::flatten]] std::string fast_neon_base64_encode(const std::vector<uint8_t>& data) {
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_neon_base64_encode(const std::vector<uint8_t>& data) {
     size_t len = data.size();
     
     // Fast path for tiny inputs - avoid SIMD overhead

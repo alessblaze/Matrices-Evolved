@@ -1,16 +1,22 @@
 /*
- * Copyright (C) 2025 Aless Microsystems
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, version 3 of the License, or under
- * alternative licensing terms as granted by Aless Microsystems.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- */
+
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
 
 #include "../include/ams-avx.h"
 
@@ -56,7 +62,7 @@ static inline __m256i extract_indices_to_bytes_avx2(const __m256i& packed) {
     __m256i idx2 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(packed, 6), mask6), 16);
     __m256i idx3 = _mm256_slli_epi32(_mm256_and_si256(packed, mask6), 24);
     
-    if (is_debug_enabled()) {
+    if (debug_enabled) {
         alignas(32) uint32_t idx0_arr[8], idx1_arr[8], idx2_arr[8], idx3_arr[8];
         _mm256_store_si256(reinterpret_cast<__m256i*>(idx0_arr), idx0);
         _mm256_store_si256(reinterpret_cast<__m256i*>(idx1_arr), idx1);
@@ -217,7 +223,7 @@ static inline __m256i map_base64_1pshufb_32(__m256i idx) {
     return out;
 }
 
-static inline __m256i map_base64_1pshufb_merged(__m256i idx) {
+[[clang::always_inline]] static inline __m256i map_base64_1pshufb_merged(__m256i idx) {
     __m256i gt25 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(25));
     __m256i gt51 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(51));
     __m256i gt61 = _mm256_cmpgt_epi8(idx, _mm256_set1_epi8(61));
@@ -283,7 +289,7 @@ static inline __m256i lut_lookup_avx2(const __m256i& indices) {
 }
 
 // AVX2 base64 chunk processor using permute operations
-static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
+[[clang::always_inline]] static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     // Lemire approach: __m256i in = _mm256_maskload_epi32(reinterpret_cast<const int*>(src - 4), _mm256_set_epi32(0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x00000000));
     
     // Load two consecutive registers
@@ -325,7 +331,7 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     return map_base64_1pshufb_merged(indices_vec);
 }
 
-[[gnu::hot, gnu::flatten]] std::string fast_sse_base64_encode_avx(const std::vector<uint8_t>& data) {
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode_avx(const std::vector<uint8_t>& data) {
     size_t len = data.size();
     
     // Fast path for tiny inputs - avoid SIMD overhead
@@ -366,7 +372,7 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     // Process 24-byte blocks directly with AVX2 - full register utilization
     int chunk_count = 0;
     while (len >= 48) {
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             DEBUG_LOG("Processing chunk " + std::to_string(chunk_count) + ", remaining len: " + std::to_string(len));
             DEBUG_LOG("Source offset: " + std::to_string(src - data.data()) + ", dest offset: " + std::to_string(dest - dest_orig));
         }
@@ -374,7 +380,7 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
         __m256i chars = process_avx2_chunk_direct(src);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dest), chars);
         
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             alignas(32) char temp[32];
             _mm256_store_si256(reinterpret_cast<__m256i*>(temp), chars);
             std::string chunk_str(temp, 32);
@@ -386,9 +392,11 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
         len -= 24;
         chunk_count++;
     }
+    // Clear upper 128 bits of YMM registers before transitioning to scalar code
+    _mm256_zeroupper();
     
     // Fallback scalar processing for remaining bytes
-    if (is_debug_enabled() && len > 0) {
+    if (debug_enabled && len > 0) {
         DEBUG_LOG("Scalar fallback for remaining " + std::to_string(len) + " bytes");
     }
     
@@ -401,7 +409,7 @@ static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
             base64_chars[val & 63]
         };
         
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             std::string scalar_str(scalar_chars, 4);
             DEBUG_LOG("Scalar triplet: " + scalar_str);
         }

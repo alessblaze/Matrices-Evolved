@@ -17,15 +17,10 @@ of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for deta
 You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
 
 */
-
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_ALIGNED)
 #pragma once
+
 #include <vector>
-#include <string>
-#include <cstring>
+#include <string_view>
 #include <cstdint>
-#include "../../../global.h"
-extern thread_local std::string base64_buffer;
-[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode_aligned(const std::vector<uint8_t>& data);
-[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode_aligned_alt(const std::vector<uint8_t>& data);
-#endif
+
+std::vector<uint8_t> fast_base64_decode_sse2_rangecmp(std::string_view input);

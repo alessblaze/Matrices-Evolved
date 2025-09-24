@@ -1,17 +1,22 @@
 /*
- * Copyright (C) 2025 Aless Microsystems
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, version 3 of the License, or under
- * alternative licensing terms as granted by Aless Microsystems.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- */
 
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
 
 #include "ed25519.h"
 
@@ -74,7 +79,7 @@ std::vector<uint8_t> get_verify_key(const std::vector<uint8_t>& signing_key) {
             return false;
         }
     
-    if (is_debug_enabled()) {
+    if (debug_enabled) {
         std::string sig_hex;
         sig_hex.reserve(std::min(size_t(16), signature_bytes.size()) * 2);
         for (size_t i = 0; i < std::min(size_t(16), signature_bytes.size()); i++) {
@@ -112,7 +117,7 @@ std::vector<uint8_t> get_verify_key(const std::vector<uint8_t>& signing_key) {
         int verify_result = EVP_DigestVerify(ctx, signature_bytes.data(), 64, json_bytes.data(), json_bytes.size());
         result = (verify_result == 1);
         
-        if (is_debug_enabled()) {
+        if (debug_enabled) {
             DEBUG_LOG("EVP_DigestVerify result: " + std::to_string(verify_result) + " (1=success, 0=fail, <0=error)");
             DEBUG_LOG("Signature verification: " + std::string(result ? "SUCCESS" : "FAILED"));
         }

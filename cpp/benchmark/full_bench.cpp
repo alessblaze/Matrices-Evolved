@@ -1,3 +1,23 @@
+/*
+
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
+
 #include <chrono>
 #include <iostream>
 #include <vector>
@@ -9,7 +29,8 @@
 #include <numeric>
 
 #include "functions.cpp"
-
+/// This is basically a test harness for benchmarking the various functions
+/// this is not hardware independent test, results may vary accross hardware
 class Timer {
 public:
     void start() { start_time = std::chrono::high_resolution_clock::now(); }
@@ -180,14 +201,29 @@ int main() {
     std::map<std::string, std::vector<double>> overall_times;
     
     std::vector<std::string> function_names = {
-        "OpenSSL", "AMS SSE", "Mulla SSE", "AMS SSE Aligned", "AVX2 Lemire", "AMS AVX2 Custom", "AMS NEON"
+        "OpenSSL", "AMS SSE", "Mulla SSE", "AMS SSE Aligned", "AMS SSE Aligned2", "AVX2 Lemire", "AMS AVX2 Custom", "AMS NEON"
     };
     
     std::vector<std::function<std::string(const std::vector<uint8_t>&)>> functions = {
         openssl_base64_encode, fast_sse_base64_encode, fast_mula_base64_encode,
-        fast_sse_base64_encode_aligned, fast_avx2_base64_encode_lemire, fast_sse_base64_encode_avx,
+        fast_sse_base64_encode_aligned, fast_sse_base64_encode_aligned_alt, fast_avx2_base64_encode_lemire, fast_sse_base64_encode_avx,
         fast_neon_base64_encode
     };
+    
+    // Base64 decoder function names and implementations
+    std::vector<std::string> decoder_names = {
+        "Lemire AVX2", "AMS AVX2 Range", "AMS SSE Range", "AMS NEON Range"
+    };
+    
+    std::vector<std::function<std::vector<uint8_t>(std::string_view)>> decoders = {
+        fast_base64_decode_signature, fast_base64_decode_avx2_rangecmp ,fast_base64_decode_sse2_rangecmp, fast_base64_decode_neon_rangecmp
+    };
+    
+    // Volatile sinks to prevent dead-code elimination
+    volatile size_t encoder_sink = 0;
+    volatile uint8_t encoder_byte_sink = 0;
+    volatile size_t decoder_sink = 0;
+    volatile uint8_t decoder_byte_sink = 0;
     
     for (const auto& config : test_configs) {
         const std::string& config_name = config.first;
@@ -220,6 +256,8 @@ int main() {
                 timer.start();
                 for (int j = 0; j < iterations; ++j) {
                     result = functions[i](data);
+                    encoder_sink += result.size();
+                    if (!result.empty()) encoder_byte_sink ^= result[0];
                 }
                 double elapsed = timer.stop();
                 
@@ -267,6 +305,102 @@ int main() {
                       << std::endl;
         }
     }
+    
+    // Base64 Decoder Benchmarks
+    std::cout << "\n\n=== BASE64 DECODER BENCHMARKS ===\n";
+    std::cout << "=============================================\n\n";
+    
+    std::map<std::string, std::map<std::string, std::vector<double>>> decode_results;
+    std::map<std::string, std::vector<double>> decode_overall_times;
+    
+    for (const auto& config : test_configs) {
+        const std::string& config_name = config.first;
+        for (const std::string& func : decoder_names) {
+            decode_results[config_name][func] = std::vector<double>();
+        }
+    }
+    
+    for (const std::string& func : decoder_names) {
+        decode_overall_times[func] = std::vector<double>();
+    }
+    
+    for (const auto& config : test_configs) {
+        const std::string& config_name = config.first;
+        size_t size = config.second;
+        
+        for (const std::string& data_type : data_types) {
+            const auto& data = generate_data(size, data_type);
+            
+            // Encode data first to get base64 string for decoding
+            std::string encoded = openssl_base64_encode(data);
+            
+            int iterations = size < 1048576 ? std::max(10, static_cast<int>(100000 / size)) : 
+                            size < 10485760 ? 10 : 1;
+            
+            for (size_t i = 0; i < decoders.size(); ++i) {
+                Timer timer;
+                std::vector<uint8_t> result;
+                
+                // Warmup
+                for (int j = 0; j < 5; ++j) {
+                    result = decoders[i](encoded);
+                }
+                
+                timer.start();
+                for (int j = 0; j < iterations; ++j) {
+                    result = decoders[i](encoded);
+                    decoder_sink += result.size();
+                    if (!result.empty()) decoder_byte_sink ^= result[0];
+                }
+                double elapsed = timer.stop();
+                
+                double avg_time_us = (elapsed * 1e6) / iterations;
+                
+                decode_results[config_name][decoder_names[i]].push_back(avg_time_us);
+                decode_overall_times[decoder_names[i]].push_back(avg_time_us);
+            }
+        }
+    }
+    
+    std::cout << "\n=== DECODER RESULTS BY TEST CONFIGURATION ===\n";
+    for (const auto& config : test_configs) {
+        const std::string& config_name = config.first;
+        size_t size = config.second;
+        
+        std::cout << "\n" << config_name << " (" << size << " bytes):\n";
+        std::cout << std::string(40, '-') << "\n";
+        
+        for (const std::string& func : decoder_names) {
+            std::vector<double> valid_times = decode_results[config_name][func];
+            
+            if (!valid_times.empty()) {
+                double mean_time = stable_mean(valid_times);
+                double cycles_per_byte = (mean_time * 1e-6 * cpu_freq_ghz * 1e9) / size;
+                std::cout << std::setw(15) << func 
+                          << std::setw(12) << std::fixed << std::setprecision(2) << mean_time << " μs"
+                          << " | " << std::fixed << std::setprecision(3) << cycles_per_byte << " cyc/B"
+                          << std::endl;
+            }
+        }
+    }
+    
+    std::cout << "\n\n=== DECODER OVERALL MEAN RESULTS ===\n";
+    std::cout << std::setw(15) << "Function" << std::setw(15) << "Average Time" << std::endl;
+    std::cout << std::string(30, '-') << std::endl;
+    
+    for (const std::string& func : decoder_names) {
+        std::vector<double> valid_times = decode_overall_times[func];
+        
+        if (!valid_times.empty()) {
+            double mean_time = stable_mean(valid_times);
+            std::cout << std::setw(15) << func 
+                      << std::setw(12) << std::fixed << std::setprecision(2) << mean_time << " μs"
+                      << std::endl;
+        }
+    }
+    
+    // Consume volatile sinks to ensure they're not optimized away
+    std::cout << "\n[Benchmark completed - processed " << encoder_sink << "/" << decoder_sink << " total bytes]\n";
     
     return 0;
 }

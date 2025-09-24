@@ -1,16 +1,22 @@
 /*
- * Copyright (C) 2025 Aless Microsystems
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, version 3 of the License, or under
- * alternative licensing terms as granted by Aless Microsystems.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- */
+
+Matrices-Evolved - High Performance ops offloaded to Rust and C++
+Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
+
+This program is licensed under the Aless Microsystems Source-Available License (Non-Commercial, No Military) v1.0 Available in the Root
+Directory of the project as LICENSE in Text Format.
+You may use, copy, modify, and distribute this program for Non-Commercial purposes only, subject to the terms of that license.
+Use by or for military, intelligence, or defense entities or purposes is strictly prohibited.
+
+If you distribute this program in object form or make it available to others over a network, you must provide the complete
+corresponding source code for the provided functionality under this same license.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the License for details.
+
+You should have received a copy of the License along with this program; if not, see the LICENSE file included with this source.
+
+*/
 
 #pragma once
 #ifdef __AVX2__
@@ -42,10 +48,10 @@
 #define DISABLE_SSE_BASE64_ENCODER //pass
 #define DISABLE_SSE_BASE64_ENCODER_MULA //pass
 //#define DISABLE_AVX2_BASE64_DECODER
-#define DISABLE_SSE_BASE64_ENCODER_ALIGNED //pass
+//#define DISABLE_SSE_BASE64_ENCODER_ALIGNED //pass
 #define DISABLE_SSE_BASE64_ENCODER_LEMIRE //pass
-#define DISABLE_SSE_BASE64_ENCODER_AVX //pass
-//#define DISABLE_NEON_BASE64_ENCODER //pass
+#define DISABLE_SSE_BASE64_ENCODER_AVX //pass - ENABLE AVX2 for speed
+#define DISABLE_NEON_BASE64_ENCODER //pass
 
 #endif
 
@@ -67,28 +73,17 @@
 
 
 // Debug logging infrastructure - check environment variable at runtime
-inline bool is_debug_enabled() {
-    static bool cached_result = []() {
-        const char* env1 = std::getenv("SYNAPSE_CPP_CRYPTO_DEBUG");
-        const char* env2 = std::getenv("SYNAPSE_RUST_CRYPTO_DEBUG");
-        return (env1 && std::string(env1) == "1") || (env2 && std::string(env2) == "1");
-    }();
-    return cached_result;
-}
+static bool debug_enabled = []() {
+    const char* env = std::getenv("SYNAPSE_RUST_CRYPTO_DEBUG");
+    return env && std::string(env) == "1";
+}();
 
 #define DEBUG_LOG(msg) do { \
-    std::ofstream logfile("/tmp/cpp_crypto_debug.log", std::ios::app); \
-    if (logfile.is_open()) { \
-        logfile << "DEBUG C++ crypto: " << msg << " (debug_enabled=" << (is_debug_enabled() ? "true" : "false") << ")" << std::endl; \
-        logfile.close(); \
-    } \
-    if (is_debug_enabled()) { \
+    if (debug_enabled) { \
         std::cout << "DEBUG C++ crypto: " << msg << std::endl; \
     } \
 } while(0)
 
-// Keep the old variable for compatibility
-static bool debug_enabled = is_debug_enabled();
 
 // Hex lookup table for debug output
 static constexpr char hex_lut[] = "0123456789abcdef";
@@ -117,14 +112,6 @@ struct Task {
 // Namespace alias
 namespace nb = nanobind;
 
-// Debug initialization function
-inline void debug_init() {
-    std::ofstream logfile("/tmp/cpp_crypto_debug.log", std::ios::app);
-    if (logfile.is_open()) {
-        logfile << "DEBUG INIT: C++ crypto module loaded, debug_enabled=" << (is_debug_enabled() ? "true" : "false") << std::endl;
-        logfile.close();
-    }
-}
 
 // Each module can define its own thread-local buffers locally
 // No need for shared buffers across modules

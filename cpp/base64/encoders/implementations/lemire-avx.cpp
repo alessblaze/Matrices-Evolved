@@ -74,7 +74,7 @@ static inline __m256i enc_translate(const __m256i in) {
  * @param data Input byte vector to encode
  * @return Base64 encoded string (unpadded)
  */
-[[gnu::hot, gnu::flatten]] std::string fast_avx2_base64_encode_lemire(const std::vector<uint8_t>& data) {
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_avx2_base64_encode_lemire(const std::vector<uint8_t>& data) {
     size_t len = data.size();
     
     // Fast path for tiny inputs
@@ -133,6 +133,8 @@ static inline __m256i enc_translate(const __m256i in) {
             }
         }
     }
+    // Clear upper 128 bits of YMM registers before transitioning to scalar code
+    _mm256_zeroupper();
     
     // Scalar fallback for remaining bytes
     while (len >= 3) {

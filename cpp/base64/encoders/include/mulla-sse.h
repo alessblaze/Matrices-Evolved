@@ -20,5 +20,5 @@
 #include <cstdint>
 #include "../../../global.h"
 extern thread_local std::string base64_buffer;
-std::string fast_mula_base64_encode(const std::vector<uint8_t>& data);
+[[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_mula_base64_encode(const std::vector<uint8_t>& data);
 #endif
