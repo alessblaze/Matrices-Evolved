@@ -292,43 +292,34 @@ static inline __m256i lut_lookup_avx2(const __m256i& indices) {
 [[clang::always_inline]] static inline __m256i process_avx2_chunk_direct(const uint8_t* src) {
     // Lemire approach: __m256i in = _mm256_maskload_epi32(reinterpret_cast<const int*>(src - 4), _mm256_set_epi32(0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x00000000));
     
-    // Load two consecutive registers
-    __m256i r0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
-    __m256i r1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 16));
-    
-    // Create proper layout using lane-local operations
-    __m256i zeros = _mm256_setzero_si256();
-    
-    // Lower lane: bytes 0-11 with 4-byte offset
-    __m256i lower_shifted = _mm256_alignr_epi8(r0, zeros, 12);
-    
-    // Upper lane: extract bytes 12-23 and position at 16-27
-    __m256i r0_for_upper = _mm256_permute2x128_si256(r0, r0, 0x00);
-    __m256i r1_for_upper = _mm256_permute2x128_si256(r1, r1, 0x00);
-    __m256i bytes_12_23 = _mm256_alignr_epi8(r1_for_upper, r0_for_upper, 12);
-    __m256i upper_shifted = _mm256_permute2x128_si256(zeros, bytes_12_23, 0x20);
-    
-    // Combine to match maskload layout
-    __m256i in = _mm256_blend_epi32(lower_shifted, upper_shifted, 0x70);
-    
-    // shuffle for triplet extraction
-    static const __m256i shuffle = _mm256_setr_epi8(
-        6, 5, 4, -1,   9, 8, 7, -1,  12,11,10, -1,  15,14,13, -1,
-        2, 1, 0, -1,   5, 4, 3, -1,   8, 7, 6, -1,  11,10, 9, -1
+     __m256i r0 = _mm256_loadu_si256((const __m256i*)(src +  0));   // 0..31
+    __m256i r1 = _mm256_loadu_si256((const __m256i*)(src + 16));   // 16..47
+    __m256i z  = _mm256_setzero_si256();
+
+    __m256i low12 = _mm256_alignr_epi8(r0, z, 12);
+
+    __m256i r0low_dup = _mm256_permute2x128_si256(r0, r0, 0x00);
+    __m256i r1low_dup = _mm256_permute2x128_si256(r1, r1, 0x00);
+    __m256i hi12_low  = _mm256_alignr_epi8(r1low_dup, r0low_dup, 12);
+
+    __m256i in = _mm256_permute2x128_si256(low12, hi12_low, 0x20); 
+
+    // lane-local triplet gather
+    const __m256i gather = _mm256_setr_epi8(
+        6,5,4,-1,  9,8,7,-1,  12,11,10,-1, 15,14,13,-1,
+        2,1,0,-1,  5,4,3,-1,   8,7,6,-1,  11,10, 9,-1
     );
-    
-    __m256i packed = _mm256_shuffle_epi8(in, shuffle);
-    
-    // Extract base64 indices
-    static const __m256i mask6 = _mm256_set1_epi32(0x3f);
-    __m256i idx0 = _mm256_and_si256(_mm256_srli_epi32(packed, 18), mask6);
-    __m256i idx1 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(packed, 12), mask6), 8);
-    __m256i idx2 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(packed, 6), mask6), 16);
-    __m256i idx3 = _mm256_slli_epi32(_mm256_and_si256(packed, mask6), 24);
-    __m256i indices_vec = _mm256_or_si256(_mm256_or_si256(idx0, idx1), _mm256_or_si256(idx2, idx3));
-    
-    //return lut_lookup_avx2_selects(indices_vec);
-    return map_base64_1pshufb_merged(indices_vec);
+    __m256i packed = _mm256_shuffle_epi8(in, gather);               
+
+    // extract 6-bit indices into byte 0..3 of each dword
+    const __m256i m6 = _mm256_set1_epi32(0x3f);
+    __m256i i0 = _mm256_and_si256(_mm256_srli_epi32(packed, 18), m6);
+    __m256i i1 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(packed, 12), m6), 8);
+    __m256i i2 = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(packed,  6), m6), 16);
+    __m256i i3 = _mm256_slli_epi32(_mm256_and_si256(packed, m6), 24);
+    __m256i indices = _mm256_or_si256(_mm256_or_si256(i0, i1), _mm256_or_si256(i2, i3));
+    // index -> ASCII via one-pshufb delta LUT + tiny patch (reuse your map_base64_1pshufb_merged)
+    return map_base64_1pshufb_merged(indices);  
 }
 
 [[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode_avx(const std::vector<uint8_t>& data) {
