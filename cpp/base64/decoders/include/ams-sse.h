@@ -23,4 +23,4 @@ You should have received a copy of the License along with this program; if not, 
 #include <string_view>
 #include <cstdint>
 
-std::vector<uint8_t> fast_base64_decode_sse2_rangecmp(std::string_view input);
+std::vector<uint8_t> fast_base64_decode_sse_rangecmp(std::string_view input);

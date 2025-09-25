@@ -212,11 +212,12 @@ int main() {
     
     // Base64 decoder function names and implementations
     std::vector<std::string> decoder_names = {
-        "Lemire AVX2", "AMS AVX2 Range", "AMS SSE Range", "AMS NEON Range"
+        "Lemire AVX2", "AMS AVX2 Range", "AMS SSE Range", "AMS NEON Range" , "AMS NEON LUT", "AMS SSE Range Alt"
     };
     
     std::vector<std::function<std::vector<uint8_t>(std::string_view)>> decoders = {
-        fast_base64_decode_signature, fast_base64_decode_avx2_rangecmp ,fast_base64_decode_sse2_rangecmp, fast_base64_decode_neon_rangecmp
+        fast_base64_decode_signature, fast_base64_decode_avx2_rangecmp ,fast_base64_decode_sse2_rangecmp, fast_base64_decode_neon_rangecmp, fast_base64_decode_neon_lut2x128,
+        fast_base64_decode_sse_rangecmp
     };
     
     // Volatile sinks to prevent dead-code elimination

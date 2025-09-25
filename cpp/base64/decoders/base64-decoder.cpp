@@ -20,9 +20,10 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "include/base64-decoder.h"
 //#include "include/lemire-avx.h"
-//#include "include/ams-avx.h"
+#include "include/ams-avx.h"
 //#include "include/ams-sse.h"
-#include "include/ams-neon.h"
+//#include "include/ams-neon.h"
+//#include "include/ams-neon-lut.h"
 // Thread-local decode buffer
 thread_local std::vector<uint8_t> decode_buffer(1024);
 
@@ -61,8 +62,10 @@ std::vector<uint8_t> base64_decode(std::string_view encoded_string) {
     if (encoded_string.size() >= 32) {
          DEBUG_LOG("Taking SIMD fast path");
          //auto simd_result = fast_base64_decode_signature(encoded_string);
-         //auto simd_result = fast_base64_decode_avx2_rangecmp(encoded_string);
-         auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
+         auto simd_result = fast_base64_decode_avx2_rangecmp(encoded_string);
+         //auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
+         //auto simd_result = fast_base64_decode_neon_lut2x128(encoded_string);
+         //auto simd_result = fast_base64_decode_sse_rangecmp(encoded_string);
          if (debug_enabled) {
              // OpenSSL verification for debugging
              std::string padded_input(encoded_string);
