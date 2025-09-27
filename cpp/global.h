@@ -49,8 +49,8 @@ You should have received a copy of the License along with this program; if not, 
 #define DISABLE_SSE_BASE64_ENCODER_MULA //pass
 //#define DISABLE_AVX2_BASE64_DECODER
 #define DISABLE_SSE_BASE64_ENCODER_ALIGNED //pass
-#define DISABLE_SSE_BASE64_ENCODER_LEMIRE //pass
-//#define DISABLE_SSE_BASE64_ENCODER_AVX //pass - ENABLE AVX2 for speed
+//#define DISABLE_SSE_BASE64_ENCODER_LEMIRE //pass
+#define DISABLE_SSE_BASE64_ENCODER_AVX //pass - ENABLE AVX2 for speed
 #define DISABLE_NEON_BASE64_ENCODER //pass
 
 #endif

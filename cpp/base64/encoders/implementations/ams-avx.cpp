@@ -46,7 +46,174 @@ thread_local std::string base64_buffer;
  * - Processes 24 input → 32 output bytes per iteration
  * - Falls back to 4x unrolled scalar for remainder
  */
-// Base64 alphabet lookup table
+
+ /*
+// During our extended research we discovered a family of mulhi/mullo
+// multiplier/mask parameterizations for SIMD sextet extraction.
+//
+// The following methods and constant families were derived by Aless
+// Microsystems from first principles (bit-layout equations + multiply
+// identities). They are provided under this project's license; see the
+// LICENSE header for details.
+//
+// NOTE: The high-level multiply-and-mask trick (use of vpmulhi/vpmullo
+// with masks and a pre-shuffle) is a known SIMD technique used in prior
+// work on Base64.  What this project documents and supplies are the
+// explicit derivations, alternative byte-order variants, and tested
+// constant families for different pre-shuffle layouts.  Those
+// derivations are independently produced and documented here.
+// These constants and the derivation process were produced independently by Aless Microsystems; 
+// they are not copied from any externally published constant tables.
+### Setup
+
+- Define per 24‑bit group bytes $a,b,c$ and halfwords per lane as $h = (a \ll 8) + b$ and $\ell = (b \ll 8) + c$, with target sextets $i_0=a\gg 2$, $i_1=((a\&3)\ll 4)\,|\, (b\gg 4)$, $i_2=((b\&15)\ll 2)\,|\, (c\gg 6)$, $i_3=c\&63$ packed into bytes via a lane‑local vpshufb pre‑arrangement as in the Muła–Lemire method [^1][^4].
+- The algorithm computes two masked paths, $t_1 = \mathrm{mulhi}(x_R, C_{hi})$ and $t_3 = \mathrm{mullo}(x_L, C_{lo})$, where $x_R = \mathrm{in} \,\&\, 0x0fc0fc00$ and $x_L = \mathrm{in} \,\&\, 0x003f03f0$, then ORs them to produce the four sextets per dword without variable shifts.[^2][^1]
+
+
+### Mulhi implements right shifts
+
+- For any 16‑bit lane value $x$ and power‑of‑two multiplier $2^k$, vpmulhi_epu16 computes the high half of the product: $\mathrm{mulhi}(x,2^k) = \left\lfloor\frac{x\cdot 2^k}{2^{16}}\right\rfloor = x \gg (16-k)$, so choosing $k=6$ yields a right shift by 10, and $k=10$ yields a right shift by 6, exactly the two right shifts needed from $h$ and $\ell$ respectively.[^3][^1]
+- The canonical constant 0x04000040 encodes 16‑bit multipliers {0x0400, 0x0040} per halfword in each 32‑bit dword, giving $h \gg 6$ (for 0x0400 = $2^{10}$) and $\ell \gg 10$ (for 0x0040 = $2^6$) or vice‑versa depending on byte order; swapping these two halfword multipliers yields equivalent results under LE vs BE pre‑shuffles (e.g., 0x00400400/0x04000040 families).[^1][^2]
+- Adding 1 to a mulhi power‑of‑two does not change the result: $\mathrm{mulhi}(x,2^k+1) = \left\lfloor\frac{x\cdot 2^k}{2^{16}}\right\rfloor + \left\lfloor\frac{x}{2^{16}}\right\rfloor = \mathrm{mulhi}(x,2^k)$ because $x<2^{16}$ implies $x\gg 16 = 0$, which explains variants like 0x04010040 or 0x04000041 producing identical high‑half bytes under the same masks.[^3][^1]
+
+
+### Mullo implements left shifts modulo $2^{16}$
+
+- For any 16‑bit lane value $x$ and power‑of‑two multiplier $2^m$, vpmullo_epi16 computes $\mathrm{mullo}(x,2^m) = (x \ll m) \bmod 2^{16}$, so choosing $m=8$ and $m=4$ yields the left‑shift parts needed to place the low‑order contributions of $h$ and $\ell$ for $i_1$ and $i_2$ respectively.[^1][^3]
+- The canonical constant 0x01000010 encodes 16‑bit multipliers {0x0100, 0x0010} per halfword, i.e., left shifts by 8 and 4 within each dword, and swapping these per halfword (e.g., 0x00100100) matches the LE vs BE arrangement when the pre‑shuffle flips which halfword carries which group’s contribution.[^2][^1]
+- Adding 1 to a mullo power‑of‑two is harmless when the masked input has its low $m$ bits zero: $\mathrm{mullo}(x,2^m+1) \equiv (x \ll m) + x \pmod{2^{16}} = (x \ll m)$ if $x \equiv 0 \pmod{2^m}$, which is ensured by using maskL so that the low 8 bits of the “$m=8$” lane and the low 4 bits of the “$m=4$” lane are zero before the multiply.[^3][^1]
+
+
+### Why multiple constant families appear
+
+- Different “bcab vs bacb” labels reflect whether the pre‑shuffle presents the two 16‑bit halfwords as $[h,\ell]$ or $[\ell,h]$ inside each 32‑bit dword, which simply swaps which halfword multiplier must be 0x0400 vs 0x0040 for mulhi and 0x0100 vs 0x0010 for mullo, yielding the two canonical families 0x04000040/0x01000010 (BE) and 0x00400400/0x00100100 (LE) under equivalent masks.[^4][^1]
+- The “+1” variants in the mulhi constants are mathematically equivalent for the high‑half as shown above, and “+1” variants for mullo are equivalent when maskL zeroes the low $m$ bits of each lane’s operand, which is precisely how the Muła–Lemire masks are designed prior to the multiplies.[^2][^1]
+
+
+### Copyable math identities
+
+- $\mathrm{mulhi}(x,2^k) = x \gg (16-k)$ and $\mathrm{mulhi}(x,2^k+1) = \mathrm{mulhi}(x,2^k)$ for $x<2^{16}$.[^3]
+- $\mathrm{mullo}(x,2^m) \equiv (x \ll m) \pmod{2^{16}}$ and $\mathrm{mullo}(x,2^m+1) \equiv (x \ll m)$ if $x \equiv 0 \pmod{2^m}$ due to prior masking that zeroes the low $m$ bits.[^1][^3]
+- With $h=(a\ll 8)+b$ and $\ell=(b\ll 8)+c$, choose per‑halfword multipliers $\{2^{10},2^{6}\}$ for mulhi and $\{2^{8},2^{4}\}$ for mullo (order depends on LE/BE pre‑shuffle) to realize $i_0,i_1,i_2,i_3$ in one mulhi, one mullo, and one OR per lane under masks $0x0fc0fc00$ and $0x003f03f0$.[^2][^1]
+
+## I believe it’s not as simple as it sounds and there are more variants to be discovered.
+## Our methods can be slower, but in practical use this won’t matter.
+## I would like to see more methods coming from the younger generation of programmers,
+## which do not rely on these old methods.
+## These tables are available under the project license. They are not guaranteed to work.
+## If you use these elsewhere, you must abide by the license and cite this project and author.
+## Always test if it works before using it in anything meaningful.
+
+bacb (little‑endian dword view), idx_order=(0,1,2,3)
+
+Per 128‑bit lane input (12 bytes = 4 groups):
+a0 b0 c0 a1 b1 c1 a2 b2 c2 a3 b3 c3
+
+Lane‑local preshuffle (halves swapped relative to bcab):
+D0: [ b0 ][ c0 ] | [ a0 ][ b0 ]
+D1: [ b1 ][ c1 ] | [ a1 ][ b1 ]
+D2: [ b2 ][ c2 ] | [ a2 ][ b2 ]
+D3: [ b3 ][ c3 ] | [ a3 ][ b3 ]
+
+Masks (same bitfields, expressed in LE dword view notation):
+maskR = 0x0fc0fc0f (or 0xfc0f0fc0 under the alternate naming)
+maskL = 0xf03f03f0 (or 0x03f0f03f under the alternate naming)
+
+Multipliers (per 16‑bit lane, swapped halves vs bcab):
+mulhi = 0x00400400 // {0x0040, 0x0400} → right shifts {10, 6}
+mullo = 0x00100100 // {0x0010, 0x0100} → left shifts {4, 8}
+
+How the multipliers implement shifts (same identities as bcab):
+mulhi(x, 2^k) = x >> (16 − k); mullo(x, 2^m) = (x << m) mod 2^16
+(LE vs BE just swaps which halfword gets which 2^k / 2^m power.)
+
+Post (t1 | t3) — per dword bytes:
+[ i0 i1 i2 i3 ] from the same abc groups as above.
+
+Equivalences:
+mulhi +1 variants are identical for 16‑bit lanes.
+mullo +1 variants are identical under maskL because low m bits are zero before multiply.
+Legend: [x] is one byte; ‘|’ separates the two 16‑bit halves inside the 32‑bit dword.
+
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410400 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400401 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410401 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400402 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410402 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400403 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410403 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400404 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410404 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400405 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410405 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400406 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410406 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400407 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410407 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400408 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410408 mullo=0x00100100
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04010040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04020040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04030040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04040040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04050040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04060040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04070040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04080040 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04010041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04020041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04030041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04040041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04050041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04060041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04070041 mullo=0x01000010
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04080041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04010040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04020040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04030040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04040040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04050040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04060040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04070040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04080040 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04010041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04020041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04030041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04040041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04050041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04060041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04070041 mullo=0x01000010
+SOLVED bcab  dword=BE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04080041 mullo=0x01000010
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410400 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400401 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410401 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400402 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410402 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400403 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410403 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400404 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410404 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400405 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410405 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400406 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410406 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400407 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410407 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400408 mullo=0x00100100
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00410408 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000040 mullo=0x01000010
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000040 mullo=0x01000010
+SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+*/
+
 static constexpr char base64_chars[64] = {
     'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
     'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
