@@ -212,6 +212,19 @@ SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  m
 SOLVED abbc  dword=BE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
 SOLVED bacb  dword=LE  idx_order=(0,1,2,3)  maskR=0x0fc0fc0f maskL=0xf03f03f0  mulhi=0x04000040 mullo=0x01000010
 SOLVED cbba  dword=LE  idx_order=(2,3,0,1)  maskR=0xfc0f0fc0 maskL=0x03f0f03f  mulhi=0x00400400 mullo=0x00100100
+
+Final Notes: the 0x0fc0fc00 and 0x003f03f0 masks would also work on LE and vice versa, it depends on the input arrangement
+and the mask.
+on some instances and input alignment would be needed like this below code.
+        __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));      // bytes 0-15
+        __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 12)); // bytes 12-27
+        __m256i inputvector = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+also in some combinations setr instead of set might be needed, it depends on data arrangement.        
+on some combaniations like cbba there might be needed one final shuffle to arrange the bytes before the LUT or other methods to 
+put the bytes in the correct order.
+      
+
+
 */
 
 static constexpr char base64_chars[64] = {
