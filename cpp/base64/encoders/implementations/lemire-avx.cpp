@@ -36,7 +36,7 @@ static inline __m256i enc_reshuffle(const __m256i input) {
          5,  6,  4,  5
     ));
     const __m256i t0 = _mm256_and_si256(in, _mm256_set1_epi32(0x0fc0fc00));
-    const __m256i t1 = _mm256_mulhi_epu16(t0, _mm256_set1_epi32(0x04010040));
+    const __m256i t1 = _mm256_mulhi_epu16(t0, _mm256_set1_epi32(0x04000040));
     const __m256i t2 = _mm256_and_si256(in, _mm256_set1_epi32(0x003f03f0));
     const __m256i t3 = _mm256_mullo_epi16(t2, _mm256_set1_epi32(0x01000010));
     return _mm256_or_si256(t1, t3);
