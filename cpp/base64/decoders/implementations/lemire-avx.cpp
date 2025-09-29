@@ -182,8 +182,12 @@ static inline __m256i dec_reshuffle(__m256i in) {
         srclen -= 32;
     }
     // Clear upper 128 bits of YMM registers before transitioning to scalar code
+    //This is a tweak to apply only on x86_64 targets because simde is used thus the same code gets compiled for ARM
+    //simd manages the intrinstic mappings but it does not support zeroupper on non native targets
+    //simde defines __AVX2__ even when not compiling for x86. So we need to limit this to x86_64 only as zeroupper is not needed on ARM.
+    #ifdef __x86_64__ 
     _mm256_zeroupper();
-    
+    #endif
 
     while (srclen >= 16) {
         // Load 16 chars, decode with AVX scalar instructions

@@ -564,7 +564,12 @@ static inline __m256i lut_lookup_avx2(const __m256i& indices) {
         chunk_count++;
     }
     // Clear upper 128 bits of YMM registers before transitioning to scalar code
+    //This is a tweak to apply only on x86_64 targets because simde is used thus the same code gets compiled for ARM
+    //simd manages the intrinstic mappings but it does not support zeroupper on non native targets
+    //simde defines __AVX2__ even when not compiling for x86. So we need to limit this to x86_64 only as zeroupper is not needed on ARM.
+    #ifdef __x86_64__ 
     _mm256_zeroupper();
+    #endif
     
     // Fallback scalar processing for remaining bytes
     if (debug_enabled && len > 0) {
