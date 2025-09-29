@@ -7,15 +7,15 @@ echo "Building and publishing matrices_evolved..."
 rm -rf dist/ build/ wheelhouse/
 
 # Build wheel
-python3 -m build --wheel
+python3.11 -m build --wheel
 
 # Install auditwheel if not present
-pip install auditwheel twine
+python3.11 -m pip install auditwheel twine
 
 # Repair wheel for manylinux compatibility
-auditwheel repair dist/*.whl --plat manylinux_2_34_x86_64
+python3.11 -m auditwheel repair dist/*.whl --plat manylinux_2_34_x86_64
 
 # Upload to PyPI
-python3 -m twine upload wheelhouse/*
+python3.11 -m twine upload wheelhouse/*
 
 echo "Successfully published to PyPI!"

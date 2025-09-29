@@ -22,6 +22,7 @@ You should have received a copy of the License along with this program; if not, 
 #if defined (__AVX2__) || defined(__ARM_NEON)
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #endif
+#define BOOST_ALL_NO_LIB
 #include <iostream>
 #include <fstream>
 #include <string>

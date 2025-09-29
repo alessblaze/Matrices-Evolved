@@ -19,6 +19,7 @@ You should have received a copy of the License along with this program; if not, 
 */
 
 #include "canonicalization.h"
+#include <boost/json/src.hpp>
 
 namespace nb = nanobind;
 namespace json = boost::json;

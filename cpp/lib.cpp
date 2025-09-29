@@ -1,4 +1,5 @@
 /*
+
 Matrices-Evolved - High Performance ops offloaded to Rust and C++
 Copyright (c) 2025 Albert Blasczykowski (Aless Microsystems)
 
@@ -26,7 +27,6 @@ You should have received a copy of the License along with this program; if not, 
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/base64.h>
-#include <boost/json.hpp>
 #include <string>
 #include <vector>
 #include <map>

@@ -20,7 +20,7 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "../include/ams-avx.h"
 
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_AVX)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_AVX) || defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER_AVX)
 thread_local std::string base64_buffer;
 /**
  * AVX2-Optimized Base64 Encoder (Custom Implementation)
@@ -57,7 +57,7 @@ thread_local std::string base64_buffer;
 // LICENSE header for details.
 //
 // NOTE: The high-level multiply-and-mask trick (use of vpmulhi/vpmullo
-// with masks and a pre-shuffle) is a known SIMD technique used in prior
+// with masks and a pre-shuffle is a known SIMD technique used in prior
 // work on Base64.  What this project documents and supplies are the
 // explicit derivations, alternative byte-order variants, and tested
 // constant families for different pre-shuffle layouts.  Those
