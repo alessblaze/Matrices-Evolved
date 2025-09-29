@@ -222,8 +222,280 @@ on some instances and input alignment would be needed like this below code.
 also in some combinations setr instead of set might be needed, it depends on data arrangement.        
 on some combaniations like cbba there might be needed one final shuffle to arrange the bytes before the LUT or other methods to 
 put the bytes in the correct order.
-      
 
+
+These are some more methods we have discovered, but not implemented here.
+we are keeping these for ourselves for now.
+using pure maddubs for all indices extraction is possible, but it is slower than the mulhi/mullo methods.
+all of them may not work as expected thats why they are in comments but either functions work fine.
+would need to change just a bit to work.
+
+They are very much experimental and not tested much.
+we arent and havent used them properly either but we kept them for future reference.
+
+static inline __m256i extract_indices_pure_madd(__m256i v) {
+    // Index 0: a>>2 using MADDUBS (byte 2 in [c][b][a][0] format)
+    const __m256i mask_a = _mm256_set1_epi32(0x00FC0000);
+    const __m256i weights_a = _mm256_setr_epi8(
+        0, 0, 1, 0,  0, 0, 1, 0,  0, 0, 1, 0,  0, 0, 1, 0,
+        0, 0, 1, 0,  0, 0, 1, 0,  0, 0, 1, 0,  0, 0, 1, 0
+    );
+    __m256i va = _mm256_and_si256(v, mask_a);
+    __m256i ta = _mm256_maddubs_epi16(va, weights_a);
+    __m256i i0 = _mm256_and_si256(_mm256_srli_epi32(ta, 18), _mm256_set1_epi32(0x3F));
+    
+    // Index 1: ((a&3)<<4)|(b>>4) using MADDUBS with correct byte positions
+    // a is at byte 2, b is at byte 1 in [c][b][a][0] format
+    __m256i a_part = _mm256_and_si256(v, _mm256_set1_epi32(0x00030000));  // a&3 at byte 2
+    __m256i b_part = _mm256_and_si256(v, _mm256_set1_epi32(0x0000F000));  // b>>4 at byte 1
+    __m256i a_shifted = _mm256_srli_epi32(a_part, 16);  // Move a&3 to byte 0
+    __m256i b_shifted = _mm256_srli_epi32(b_part, 4);   // Move b>>4 to byte 1
+    __m256i combined_ab = _mm256_or_si256(a_shifted, b_shifted);
+    __m256i weights_ab = _mm256_setr_epi8(
+        16, 1, 0, 0,  16, 1, 0, 0,  16, 1, 0, 0,  16, 1, 0, 0,
+        16, 1, 0, 0,  16, 1, 0, 0,  16, 1, 0, 0,  16, 1, 0, 0
+    );
+    __m256i tab_i1 = _mm256_maddubs_epi16(combined_ab, weights_ab);
+    __m256i i1 = _mm256_and_si256(tab_i1, _mm256_set1_epi32(0x3F));
+    
+    // Index 2: Bits 11-6 using MADDUBS
+    __m256i shifted_i2 = _mm256_srli_epi32(v, 6);  // Shift right by 6 to get bits 11-6 in position 5-0
+    __m256i mask_i2 = _mm256_set1_epi32(0x0000003F);  // Mask bottom 6 bits
+    __m256i masked_i2 = _mm256_and_si256(shifted_i2, mask_i2);
+    __m256i weights_i2 = _mm256_setr_epi8(
+        1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,
+        1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0
+    );
+    __m256i tab_i2 = _mm256_maddubs_epi16(masked_i2, weights_i2);
+    __m256i i2 = _mm256_and_si256(tab_i2, _mm256_set1_epi32(0x3F));
+    
+    // Index 3: Bottom 6 bits using MADDUBS
+    __m256i mask_i3 = _mm256_set1_epi32(0x0000003F);  // Bottom 6 bits
+    __m256i masked_i3 = _mm256_and_si256(v, mask_i3);
+    __m256i weights_i3 = _mm256_setr_epi8(
+        1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,
+        1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0,  1, 0, 0, 0
+    );
+    __m256i tab_i3 = _mm256_maddubs_epi16(masked_i3, weights_i3);
+    __m256i i3 = _mm256_and_si256(tab_i3, _mm256_set1_epi32(0x3F));
+    
+    // Pack results
+    return _mm256_or_si256(
+        _mm256_or_si256(i0, _mm256_slli_epi32(i1, 8)),
+        _mm256_or_si256(_mm256_slli_epi32(i2, 16), _mm256_slli_epi32(i3, 24))
+    );
+}
+
+
+
+
+// cba0 per 32-bit dword: byte0=c, byte1=b, byte2=a, byte3=0  [arXiv:1704.00605]
+alignas(32) static const __m256i w_even = _mm256_setr_epi8(
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0,
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0
+); // select even byte of each pair (0,1) and (2,3) per dword [VPMADDUBSW semantics]
+
+// 16-bit lane masks: keep low byte of even or odd 16-bit words
+alignas(32) static const __m256i keep_even_words = _mm256_setr_epi16(
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000,
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000
+); // words 0,2,4,6,... (c-words) [even 16b lanes]
+
+alignas(32) static const __m256i keep_odd_words = _mm256_setr_epi16(
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF,
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF
+); // words 1,3,5,7,... (a-words) [odd 16b lanes]
+
+alignas(32) static const __m256i m6_32 = _mm256_set1_epi32(0x3F); // sextet mask
+
+static inline __m256i extract_indices_madd_avx2_min(__m256i v) {
+    // 1) One maddubs selects both c (pair 0,1) and a (pair 2,3) per dword into alternating 16-bit words [even,odd]
+    __m256i t16 = _mm256_maddubs_epi16(v, w_even);
+
+    // 2) Split: i0 from odd words (a), i3 from even words (c)
+    __m256i a16 = _mm256_and_si256(t16, keep_odd_words);
+    __m256i c16 = _mm256_and_si256(t16, keep_even_words);
+
+    // 3) Finish i0 and i3 in 16-bit lanes
+    __m256i i0w = _mm256_srli_epi16(a16, 2);
+    __m256i i3w = _mm256_and_si256(c16, _mm256_set1_epi16(0x003F));
+
+    // 4) Widen to 32-bit - extract from correct positions
+    __m256i i0_32 = _mm256_and_si256(_mm256_srli_epi32(i0w, 16), m6_32);
+    __m256i i3_32 = _mm256_and_si256(i3w, m6_32);
+
+    // 5) Canonical i1, i2
+    __m256i i1 = _mm256_and_si256(_mm256_srli_epi32(v, 12), m6_32);
+    __m256i i2 = _mm256_and_si256(_mm256_srli_epi32(v,  6), m6_32);
+
+    // 6) Pack to bytes [i0,i1,i2,i3] per dword
+    return _mm256_or_si256(_mm256_or_si256(i0_32, _mm256_slli_epi32(i1, 8)),
+                          _mm256_or_si256(_mm256_slli_epi32(i2, 16), _mm256_slli_epi32(i3_32, 24)));
+}
+
+
+// cba0 per 32-bit dword: byte0=c, byte1=b, byte2=a, byte3=0 [1]
+alignas(32) static const __m256i w_even = _mm256_setr_epi8(
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0,
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0
+); // select even byte of both pairs per dword (c from (0,1), a from (2,3)) [2]
+
+alignas(32) static const __m256i keep_even_words = _mm256_setr_epi16(
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000,
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000
+); // c-words (word 0 per dword) [3]
+
+alignas(32) static const __m256i keep_odd_words = _mm256_setr_epi16(
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF,
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF
+); // a-words (word 1 per dword) [3]
+
+alignas(32) static const __m256i m6_32     = _mm256_set1_epi32(0x3F);      // sextet mask [1]
+alignas(32) static const __m256i m_i2_b_lo = _mm256_set1_epi32(0x00000F00); // b low nibble (byte1) [1]
+alignas(32) static const __m256i m_i2_c_hi = _mm256_set1_epi32(0x000000C0); // c high 2 bits (byte0) [1]
+
+// weights for i2 on pair (0,1) = (c,b): even=1 for c, odd=4 for b; zero for pair (2,3) [2]
+alignas(32) static const __m256i w_i2 = _mm256_setr_epi8(
+    1,4, 0,0,  1,4, 0,0,  1,4, 0,0,  1,4, 0,0,
+    1,4, 0,0,  1,4, 0,0,  1,4, 0,0,  1,4, 0,0
+);
+
+static inline __m256i extract_indices_madd_avx2_min(__m256i v) {
+    // 1) One maddubs: select c (pair 0,1 even) and a (pair 2,3 even) into alternating 16-bit words [2]
+    __m256i t16 = _mm256_maddubs_epi16(v, w_even);
+
+    // 2) Split: i0 from odd words (a), i3 from even words (c) [3]
+    __m256i a16 = _mm256_and_si256(t16, keep_odd_words);
+    __m256i c16 = _mm256_and_si256(t16, keep_even_words);
+
+    // 3) Finish i0 (a>>2) and i3 (c&63) in 16-bit lanes, then extract to 32-bit bitfields [1][3]
+    __m256i i0w   = _mm256_srli_epi16(a16, 2);                  // a>>2 in word1 [1]
+    __m256i i3w   = _mm256_and_si256(c16, _mm256_set1_epi16(0x003F)); // c&63 in word0 [1]
+    __m256i i0_32 = _mm256_and_si256(_mm256_srli_epi32(i0w, 16), m6_32); // pick word1 -> dword [3]
+    __m256i i3_32 = _mm256_and_si256(i3w, m6_32);                       // word0 already in low 16 [3]
+
+    // 4) i1 stays canonical: (v>>12) & 63 (mixes a and b across pairs; dot-prod would need an extra shuffle) [1][4]
+    __m256i i1 = _mm256_and_si256(_mm256_srli_epi32(v, 12), m6_32);     // sextet in bits 5..0 [1]
+
+    // 5) i2 via one maddubs: pre-shift c>>6, scale b_low4<<2, sum in pair (0,1) -> word0 [1][2]
+    __m256i vb    = _mm256_and_si256(v, m_i2_b_lo);              // b & 0x0F at byte1 [1]
+    __m256i vc    = _mm256_and_si256(v, m_i2_c_hi);              // c & 0xC0 at byte0 [1]
+    __m256i vc6   = _mm256_srli_epi16(vc, 6);                    // c>>6 into bits 0..1 [1]
+    __m256i i2src = _mm256_or_si256(vb, vc6);                    // pair (0,1) holds both terms [1]
+    __m256i i2w   = _mm256_maddubs_epi16(i2src, w_i2);           // (b&0xF)*4 + (c>>6) in word0 [2]
+    __m256i i2    = _mm256_and_si256(i2w, m6_32);                // sextet in low 6 bits [1]
+
+    // 6) Pack to bytes [i0,i1,i2,i3] per dword [1]
+    __m256i r0 = i0_32;
+    __m256i r1 = _mm256_slli_epi32(i1, 8);
+    __m256i r2 = _mm256_slli_epi32(i2, 16);
+    __m256i r3 = _mm256_slli_epi32(i3_32, 24);
+    return _mm256_or_si256(_mm256_or_si256(r0, r1), _mm256_or_si256(r2, r3));
+}
+
+
+// Maddubs #1: select even bytes of both pairs -> c (pair 0,1) and a (pair 2,3). [2]
+alignas(32) static const __m256i w_even = _mm256_setr_epi8(
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0,
+    1,0, 1,0,  1,0, 1,0,   1,0, 1,0,  1,0, 1,0
+);
+
+// Maddubs #2: weights per dword bytes [b0,b1,b2,b3] = [1,4,16,1] -> word0=i2, word1=i1. [2]
+alignas(32) static const __m256i w_i12 = _mm256_setr_epi8(
+    1,4,16,1,  1,4,16,1,  1,4,16,1,  1,4,16,1,
+    1,4,16,1,  1,4,16,1,  1,4,16,1,  1,4,16,1
+);
+
+// 16-bit lane masks: keep even or odd words (word0->even, word1->odd) per dword. [3]
+alignas(32) static const __m256i keep_even_words = _mm256_setr_epi16(
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000,
+    0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000, 0x00FF,0x0000
+);
+alignas(32) static const __m256i keep_odd_words = _mm256_setr_epi16(
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF,
+    0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF, 0x0000,0x00FF
+);
+
+// Common masks. [1]
+alignas(32) static const __m256i m6_32     = _mm256_set1_epi32(0x3F);
+alignas(32) static const __m256i m_i2_c_hi = _mm256_set1_epi32(0x000000C0); // c>>6 source [1]
+alignas(32) static const __m256i m_i2_b_lo = _mm256_set1_epi32(0x00000F00); // b&0x0F source [1]
+alignas(32) static const __m256i m_i1_a_lo = _mm256_set1_epi32(0x00030000); // a&3 source [1]
+alignas(32) static const __m256i m_i1_b_hi = _mm256_set1_epi32(0x0000F000); // b>>4 source [1]
+
+// Extract i1 and i2 with one VPMADDUBSW. [2][1]
+static inline void compute_i1_i2_with_maddubs(__m256i v, __m256i& i1_32, __m256i& i2_32) {
+    __m256i vc    = _mm256_and_si256(v, m_i2_c_hi);                 // c&0xC0 at byte0 [1]
+    __m256i vc6   = _mm256_srli_epi16(vc, 6);                       // c>>6 -> bits 0..1 of byte0 [1]
+    __m256i vb_lo = _mm256_and_si256(v, m_i2_b_lo);                 // b&0x0F at byte1 [1]
+    __m256i va2   = _mm256_and_si256(v, m_i1_a_lo);                 // a&3 at byte2 [1]
+    __m256i vb_hi = _mm256_slli_epi32(_mm256_and_si256(v, m_i1_b_hi), 12); // b>>4 into byte3 low nibble [1]
+
+    __m256i T     = _mm256_or_si256(_mm256_or_si256(vc6, vb_lo), _mm256_or_si256(va2, vb_hi)); // [b0,b1,b2,b3] [1]
+    __m256i i12w  = _mm256_maddubs_epi16(T, w_i12);                 // word0=i2, word1=i1 per dword [2]
+
+    __m256i i2w   = _mm256_and_si256(i12w, keep_even_words);        // word0 [3]
+    __m256i i1w   = _mm256_and_si256(i12w, keep_odd_words);         // word1 [3]
+    i2_32         = _mm256_and_si256(i2w, m6_32);                   // sextet in low 6 bits [1]
+    i1_32         = _mm256_and_si256(_mm256_srli_epi32(i1w, 16), m6_32); // bring word1 down [3]
+}
+
+static inline __m256i extract_indices_madd_avx2_full(__m256i v) {
+    // Maddubs #1: c and a into alternating words. [2]
+    __m256i t16 = _mm256_maddubs_epi16(v, w_even);
+
+    // Split and finish i0 (a>>2) and i3 (c&63). [1][3]
+    __m256i a16 = _mm256_and_si256(t16, keep_odd_words);
+    __m256i c16 = _mm256_and_si256(t16, keep_even_words);
+    __m256i i0w = _mm256_srli_epi16(a16, 2);                        // a>>2 [1]
+    __m256i i3w = _mm256_and_si256(c16, _mm256_set1_epi16(0x003F)); // c&63 [1]
+    __m256i i0_32 = _mm256_and_si256(_mm256_srli_epi32(i0w, 16), m6_32); // pick odd word [3]
+    __m256i i3_32 = _mm256_and_si256(i3w, m6_32);                        // pick even word [3]
+
+    // Maddubs #2: compute i1 and i2 in one pass. [2][1]
+    __m256i i1_32, i2_32;
+    compute_i1_i2_with_maddubs(v, i1_32, i2_32);
+
+    // Pack [i0,i1,i2,i3] per dword. [1]
+    __m256i r0 = i0_32;
+    __m256i r1 = _mm256_slli_epi32(i1_32, 8);
+    __m256i r2 = _mm256_slli_epi32(i2_32, 16);
+    __m256i r3 = _mm256_slli_epi32(i3_32, 24);
+    return _mm256_or_si256(_mm256_or_si256(r0, r1), _mm256_or_si256(r2, r3));
+}
+
+
+Now it is possible  simply to integrate directly character mappings like below.
+
+// idx: 32 sextets (u8), each in [0..63] with 0x3F mask already applied
+// Build a “reduced nibble” key per Muła–Lemire, then VPSHUFB offsets and add.
+// Lane-local 16B lookup replicated in both 128-bit lanes.
+const __m256i tbl = _mm256_setr_epi8(
+    71,-4,-4,-4,-4,-4,-4,-4, -4,-4,-4,-19,-16, 65, 0, 0,
+    71,-4,-4,-4,-4,-4,-4,-4, -4,-4,-4,-19,-16, 65, 0, 0);
+
+// ...compute 'key' (reduced nibble per byte) with compares/arith per paper...
+__m256i offs = _mm256_shuffle_epi8(tbl, key);   // VPSHUFB per 128-bit lane
+__m256i ascii = _mm256_add_epi8(idx, offs);     // add offset -> ASCII bytes
+
+### How it works
+After extracting the four sextets per 3-byte group with VPMADDUBSW and simple shifts/masks, treat each sextet as an 8-bit element, 
+compute a small “range key” per element, use a lane-local VPSHUFB to fetch the ASCII offset for that range, 
+and add it to the sextet to get the ASCII code directly in bytes. 
+This avoids a 64-entry table and keeps everything lane-local, which fits AVX2’s 128-bit-per-lane VPSHUFB semantics for high throughput.
+The five offsets from sextet value $x\in$ to ASCII are $+65$ for $x\in$, $+71$ for $x\in$, $-4$ for $x\in$, $-19$ for $x=62$, 
+and $-16$ for $x=63$, so the final character is $x + \text{offset}(x)$ per byte lane. Muła–Lemire derive a cheap “reduced nibble” 
+per $x$ (e.g., 13 for A–Z, 0 for a–z, $x+1$ for digits, 11 for ‘+’, 12 for ‘/’) and then use VPSHUFB with a 16-byte table of 
+offsets like [71, −4, …, −19, −16, 65, 0, 0] to materialize the correct per-lane offset to add to $x$.
+Base64’s alphabet is five contiguous ranges, so each sextet 
+x∈ can be turned into its ASCII code by adding a small per-range offset, implemented with a 16-byte l
+ane-local VPSHUFB of offsets followed by a byte add, producing final characters directly from the 
+sextets in YMM registers. This eliminates the need to feed a vector of indices into a separate 
+“index-to-ASCII” packing routine, because the mapping stage itself yields the final ASCII bytes per lane.
+There is still a lightweight byte-ordering step to arrange the four character streams per 3-byte group 
+into a contiguous 32-byte output block, but this is a lane-local shuffle/transpose and not the heavier “pack indices” 
+function that operates on 32-bit slots of bitfields. On AVX2, keep in mind that VPSHUFB is lane-local, so any final 
+interleave must either stay within 128-bit halves or use one cross-lane permute to stitch halves, which is standard in published Base64 encoders
 
 */
 
