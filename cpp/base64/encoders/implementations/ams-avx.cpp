@@ -497,6 +497,17 @@ into a contiguous 32-byte output block, but this is a lane-local shuffle/transpo
 function that operates on 32-bit slots of bitfields. On AVX2, keep in mind that VPSHUFB is lane-local, so any final 
 interleave must either stay within 128-bit halves or use one cross-lane permute to stitch halves, which is standard in published Base64 encoders
 
+Richard Startin's writeup shows the actual computation: saturated subtraction of 51 maps ranges and to zero, 
+while becomes and becomes , then a comparison with 26 identifies the range and assigns it key 13 instead of 0.
+This gives the final lookup key used for the VPSHUFB offset table.
+
+PMADDUBSW approach already extracts the four sextets cleanly with simple masks and shifts, 
+you can feed those 6-bit values directly into the reduced nibble calculation, then VPSHUFB for offsets, 
+then add to get ASCII—completely bypassing any need for the Muła–Lemire unpacking/extraction stage. 
+Their extraction method involves more complex permutations and bit-field assembly because they're 
+working from a different input layout, but we've already solved that part with PMADDUBSW.
+
+
 */
 
 static constexpr char base64_chars[64] = {
