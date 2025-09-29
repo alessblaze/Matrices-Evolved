@@ -29,9 +29,10 @@
 - **Cargo**
 
 ### Install from PyPI
-
+### Only Python 3.11 wheels available. RHEL9/Ubuntu 22.04 both support it.
+## Maybe Python 3.12 in future but for now only 3.11.
 ```bash
-pip install matrices_evolved
+pip install matrices-evolved
 ```
 
 ### Build from Source
@@ -271,7 +272,7 @@ Rust Wrapper:
 
 ## License
 
-AGPL-3.0 - See [LICENSE](LICENSE) file for details.
+See [LICENSE](LICENSE) file for details.
 
 ## Links
 
