@@ -19,10 +19,7 @@ You should have received a copy of the License along with this program; if not, 
 */
 #include "../../../global.h"
 
-#include <string_view>
-#include <vector>
-#include <cstdint>
-
+#ifdef __AVX2__
 /**
  * Pack 4x6-bit sextets into 3x8-bit bytes using AVX2 bit manipulation
  * 
@@ -357,3 +354,4 @@ std::vector<uint8_t> fast_base64_decode_avx2_rangecmp(std::string_view input) {
     out.resize(dst - out.data());
     return out;
 }
+#endif

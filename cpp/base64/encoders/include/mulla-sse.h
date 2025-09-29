@@ -13,12 +13,13 @@
  */
 
 #pragma once
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA)
+#include "../../../global.h"
+
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA) || defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA)
 
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "../../../global.h"
 extern thread_local std::string base64_buffer;
 [[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_mula_base64_encode(const std::vector<uint8_t>& data);
 #endif

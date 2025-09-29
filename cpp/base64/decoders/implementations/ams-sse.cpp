@@ -20,7 +20,7 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "../../../global.h"
 #include "../include/ams-neon.h"
-
+#ifdef _AVX2__
 // Hoisted constants for mapping and validation
 static const __m128i kA     = _mm_set1_epi8('A');
 static const __m128i kZ     = _mm_set1_epi8('Z');
@@ -170,3 +170,4 @@ std::vector<uint8_t> fast_base64_decode_sse_rangecmp(std::string_view input) {
     out.resize(static_cast<size_t>(dst - out.data()));                     // [web:21]
     return out;                                                            // [web:21]
 }
+#endif

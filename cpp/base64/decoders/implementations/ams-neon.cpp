@@ -20,7 +20,7 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "../../../global.h"
 #include "../include/ams-neon.h"
-
+#ifdef __ARM_NEON
 //this is experimental 
 static const uint8x16_t kA      = vdupq_n_u8('A');
 static const uint8x16_t kZ      = vdupq_n_u8('Z');
@@ -201,3 +201,4 @@ std::vector<uint8_t> fast_base64_decode_neon_rangecmp(std::string_view input) {
     out.resize(static_cast<size_t>(dst - out.data()));
     return out;
 }
+#endif

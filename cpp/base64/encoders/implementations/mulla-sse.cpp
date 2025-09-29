@@ -14,7 +14,7 @@
 
 #include "../include/mulla-sse.h"
 
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA) || defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER_MULA)
 thread_local std::string base64_buffer;
 // Mula SSE base64 encoder - optimized unrolled implementation
 static constexpr char base64_chars[64] = {

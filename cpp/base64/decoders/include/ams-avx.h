@@ -18,7 +18,7 @@ You should have received a copy of the License along with this program; if not, 
 
 */
 #pragma once
-
+#ifdef __AVX2__
 #include <vector>
 #include <string_view>
 #include <cstdint>
@@ -29,3 +29,4 @@ You should have received a copy of the License along with this program; if not, 
  * @return Decoded binary data
  */
 std::vector<uint8_t> fast_base64_decode_avx2_rangecmp(std::string_view input);
+#endif

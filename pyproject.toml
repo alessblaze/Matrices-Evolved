@@ -8,12 +8,13 @@ version = "1.0.0"
 description = "High-performance Matrix event signing library"
 authors = [{name = "Aless Microsystems", email = "albertalesso@gmail.com"}]
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.8"
 dependencies = ["nanobind>=2.0.0"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers", 
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Topic :: Security :: Cryptography",
 ]
@@ -24,6 +25,6 @@ build-dir = "build/{wheel_tag}"
 wheel.expand-macos-universal-tags = true
 
 [tool.cibuildwheel]
-build = "cp310-*"
+build = "cp311-*"
 skip = "*-win32 *-manylinux_i686"
 

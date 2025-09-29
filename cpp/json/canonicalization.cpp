@@ -56,7 +56,7 @@ namespace json = boost::json;
  * @param len String length
  * @return true if decimal point or exponent found
  */
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined (__ARM_NEON)
 ALWAYS_INLINE bool has_decimal_point_sse(const char* str, size_t len) {
     if (debug_enabled) {
         DEBUG_LOG("SSE2 decimal check: len=" + std::to_string(len));
@@ -140,7 +140,7 @@ int fast_double_to_string(double f, char* result) {
         int len = ptr - result;
         
         // SSE2-optimized decimal point detection
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined (__ARM_NEON)
         bool has_dot = has_decimal_point_sse(result, len);
 #else
         bool has_dot = false;
@@ -269,7 +269,7 @@ ALWAYS_INLINE void write_char(char c) {
 ALWAYS_INLINE void write_string(std::string_view s) {
     ensure_space(s.size());
     
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined (__ARM_NEON)
     if (s.size() >= 16) {
         const char* src = s.data();
         char* dst = json_ptr;
@@ -298,7 +298,7 @@ ALWAYS_INLINE void write_string(std::string_view s) {
 
 ALWAYS_INLINE void write_raw_unsafe(const char* data, size_t len) {
     // Assumes space already reserved - no bounds checking
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined (__ARM_NEON)
     if (len >= 16) {
         const char* src = data;
         char* dst = json_ptr;
@@ -401,7 +401,7 @@ ALWAYS_INLINE void write_unicode_escape(unsigned char c) {
  * 
  * Performance: ~3-4x faster than scalar for large data
  */
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined (__ARM_NEON)
 ALWAYS_INLINE std::string vectorized_hex_string(const uint8_t* data, size_t size) {
     std::string result;
     result.resize(size * 2);  // Pre-allocate exact size
@@ -494,7 +494,7 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                     std::string_view s = nb::cast<std::string_view>(obj);
                     write_char('"');
                     
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
                     /**
                      * AVX2 SIMD JSON string escaping optimization
                      * 
@@ -690,7 +690,7 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                                     else write_char(static_cast<char>(c));
                             }
                         }
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
                     }
 #endif
                     write_char('"');
@@ -761,7 +761,7 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                     write_char('"');
                     const std::string& key = t.dict_pairs[t.index].first;
                     
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
 
                     if (key.size() >= 32) {
                         DEBUG_LOG("Using AVX2 vectorized dictionary key escaping for " + std::to_string(key.size()) + " bytes");
@@ -840,7 +840,7 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                             else if (c < 0x20) write_unicode_escape_unsafe(c);
                             else write_char(static_cast<char>(c));
                         }
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
                     }
 #endif
                     write_char('"');
@@ -946,7 +946,7 @@ void serialize_canonical_fast(const json::value& v) {
             write_char('"');
             std::string_view s = v.as_string();
             
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
             // Use AVX2 vectorized string escaping for large strings
             if (s.size() >= 32) {
                 DEBUG_LOG("Using AVX2 vectorized JSON string escaping for " + std::to_string(s.size()) + " bytes");
@@ -1043,7 +1043,7 @@ void serialize_canonical_fast(const json::value& v) {
                         write_char(static_cast<char>(c));
                     }
                 }
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD)
+#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
             }
 #endif
             write_char('"');

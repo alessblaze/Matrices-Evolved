@@ -15,6 +15,7 @@
 #include "../include/lemire-avx.h"
 #include "../../../global.h"
 
+#ifdef __AVX2__
 // Thread-local decode buffer
 thread_local std::vector<uint8_t> lemire_decode_buffer(1024);
 
@@ -258,3 +259,4 @@ static inline __m256i dec_reshuffle(__m256i in) {
     
     return lemire_decode_buffer;
 }
+#endif

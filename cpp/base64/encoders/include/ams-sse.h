@@ -19,13 +19,14 @@ You should have received a copy of the License along with this program; if not, 
 */
 
 #pragma once
+#include "../../../global.h"
+
 #if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER) || defined(__ARM_NEON) && !defined(DISABLE_NEON_BASE64_ENCODER) || defined(__AVX2__) && !defined(DISABLE_NEON_BASE64_ENCODER)
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "../../../global.h"
 #endif
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER) || defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER)
 extern thread_local std::string base64_buffer;
 [[gnu::hot, gnu::flatten, clang::always_inline]] std::string fast_sse_base64_encode(const std::vector<uint8_t>& data);
 #endif

@@ -20,9 +20,12 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "include/base64-decoder.h"
 //#include "include/lemire-avx.h"
+#if defined(__AVX2__)
 #include "include/ams-avx.h"
+#elif defined(__ARM_NEON)
+#include "include/ams-neon.h"
+#endif
 //#include "include/ams-sse.h"
-//#include "include/ams-neon.h"
 //#include "include/ams-neon-lut.h"
 // Thread-local decode buffer
 thread_local std::vector<uint8_t> decode_buffer(1024);
@@ -61,9 +64,14 @@ std::vector<uint8_t> base64_decode(std::string_view encoded_string) {
     // Use SIMD path for larger inputs
     if (encoded_string.size() >= 32) {
          DEBUG_LOG("Taking SIMD fast path");
-         //auto simd_result = fast_base64_decode_signature(encoded_string);
+         #if defined(__AVX2__)
+         #pragma message("Compiling AVX2")
          auto simd_result = fast_base64_decode_avx2_rangecmp(encoded_string);
-         //auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
+         #elif defined(__ARM_NEON)
+         #pragma message("Compiling ARM NEON")
+         auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
+         #endif
+         //auto simd_result = fast_base64_decode_signature(encoded_string);
          //auto simd_result = fast_base64_decode_neon_lut2x128(encoded_string);
          //auto simd_result = fast_base64_decode_sse_rangecmp(encoded_string);
          if (debug_enabled) {

@@ -47,6 +47,7 @@ find_package(nanobind CONFIG REQUIRED PATHS ${nanobind_ROOT})
 include(ExternalProject)
 
 # Boost.JSON 
+#   BUILD_BYPRODUCTS <SOURCE_DIR>/stage/lib/libboost_json.a
 # its header only but this is kept for compatibility with the existing CMake structure
 ExternalProject_Add(
   boost
@@ -54,7 +55,6 @@ ExternalProject_Add(
   CONFIGURE_COMMAND ./bootstrap.sh --with-libraries=json --with-toolset=clang-20
   BUILD_COMMAND rm project-config.jam && ./b2 toolset=clang-20 --with-json variant=release link=static cxxflags=-fPIC -O3 -static
   BUILD_IN_SOURCE 1
-  BUILD_BYPRODUCTS <SOURCE_DIR>/stage/lib/libboost_json.a
   INSTALL_COMMAND ""
 )
 
@@ -142,15 +142,10 @@ target_include_directories(_event_signing_impl PRIVATE ${BOOST_ROOT} ${SIMDE_ROO
 add_library(aws_lc_crypto STATIC IMPORTED)
 set_target_properties(aws_lc_crypto PROPERTIES IMPORTED_LOCATION ${AWS_LC_BUILD}/crypto/libcrypto.a)
 add_dependencies(aws_lc_crypto aws-lc)
-# kept for compatibility with existing CMake structure or if we add something in future
-add_library(boost_json STATIC IMPORTED)
-set_target_properties(boost_json PROPERTIES IMPORTED_LOCATION ${BOOST_ROOT}/stage/lib/libboost_json.a)
-add_dependencies(boost_json boost)
-
-target_link_libraries(_event_signing_impl PRIVATE aws_lc_crypto boost_json)
+target_link_libraries(_event_signing_impl PRIVATE aws_lc_crypto)
 target_link_options(_event_signing_impl PRIVATE -fuse-ld=lld-20)
 set_target_properties(_event_signing_impl PROPERTIES LINK_FLAGS "-fuse-ld=lld-20")
-target_compile_options(_event_signing_impl PRIVATE -fPIC)
+target_compile_options(_event_signing_impl PRIVATE -fPIC -Wno-nan-infinity-disabled)
 target_compile_features(_event_signing_impl PRIVATE cxx_std_23)
 
 # Check for C++23 feature availability
@@ -193,7 +188,7 @@ function(apply_optimizations target)
     
     # Base optimization flags 
     target_compile_options(${target} PRIVATE
-        -O3 -ffast-math -march=native -mtune=native
+        -O3 -ffast-math
         -funroll-loops -fomit-frame-pointer
         -fno-stack-protector
         -funsafe-math-optimizations
@@ -204,23 +199,31 @@ function(apply_optimizations target)
     
     include(CheckCXXCompilerFlag)
     
-    # SIMD instruction sets
-    check_cxx_compiler_flag("-mavx2" SUPPORTS_AVX2)
-    if(SUPPORTS_AVX2)
-        target_compile_options(${target} PRIVATE -mavx2)
-        message(STATUS "AVX2 support enabled")
-    endif()
-    
-    check_cxx_compiler_flag("-mfma" SUPPORTS_FMA)
-    if(SUPPORTS_FMA)
-        target_compile_options(${target} PRIVATE -mfma)
-        message(STATUS "FMA support enabled")
-    endif()
-    
-    check_cxx_compiler_flag("-mbmi2" SUPPORTS_BMI2)
-    if(SUPPORTS_BMI2)
-        target_compile_options(${target} PRIVATE -mbmi2)
-        message(STATUS "BMI2 support enabled")
+    # SIMD instruction sets - architecture specific
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        check_cxx_compiler_flag("-march=armv8-a+simd" SUPPORTS_NEON)
+        if(SUPPORTS_NEON)
+            target_compile_options(${target} PRIVATE -march=armv8-a+simd)
+            message(STATUS "NEON SIMD support enabled")
+        endif()
+    else()
+        check_cxx_compiler_flag("-mavx2" SUPPORTS_AVX2)
+        if(SUPPORTS_AVX2)
+            target_compile_options(${target} PRIVATE -mavx2)
+            message(STATUS "AVX2 support enabled")
+        endif()
+        
+        check_cxx_compiler_flag("-mfma" SUPPORTS_FMA)
+        if(SUPPORTS_FMA)
+            target_compile_options(${target} PRIVATE -mfma)
+            message(STATUS "FMA support enabled")
+        endif()
+        
+        check_cxx_compiler_flag("-mbmi2" SUPPORTS_BMI2)
+        if(SUPPORTS_BMI2)
+            target_compile_options(${target} PRIVATE -mbmi2)
+            message(STATUS "BMI2 support enabled")
+        endif()
     endif()
     
     # Memory and cache optimizations

@@ -18,9 +18,10 @@ You should have received a copy of the License along with this program; if not, 
 
 */
 #pragma once
-
+#ifdef __ARM_NEON
 #include <vector>
 #include <string_view>
 #include <cstdint>
 
 std::vector<uint8_t> fast_base64_decode_neon_lut2x128(std::string_view input);
+#endif

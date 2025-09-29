@@ -20,7 +20,7 @@ You should have received a copy of the License along with this program; if not, 
 
 #include "../../../global.h"
 #include "../include/ams-neon.h"
-
+#ifdef __ARM_NEON
 // 256-entry ASCII -> sextet table (255 = invalid)
 static constexpr uint8_t Dtbl[256] = {
   // 0..31
@@ -198,3 +198,4 @@ std::vector<uint8_t> fast_base64_decode_neon_lut2x128(std::string_view input) {
   out.resize(static_cast<size_t>(dst - out.data()));
   return out;
 }
+#endif

@@ -19,7 +19,7 @@ You should have received a copy of the License along with this program; if not, 
 */
 
 #pragma once
-#ifdef __AVX2__
+#if defined (__AVX2__) || defined(__ARM_NEON)
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #endif
 #include <iostream>

@@ -13,7 +13,7 @@
  */
 
 #pragma once
-
+#ifdef __AVX2__
 #include <vector>
 #include <string_view>
 #include <cstdint>
@@ -26,3 +26,4 @@
 extern thread_local std::vector<uint8_t> decode_buffer;
 
 [[gnu::hot, gnu::flatten]] std::vector<uint8_t> fast_base64_decode_signature(std::string_view input);
+#endif
