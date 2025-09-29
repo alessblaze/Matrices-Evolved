@@ -14,7 +14,7 @@
 
 #include "../include/lemire-avx.h"
 
-#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_LEMIRE) ||  defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER_LEMIREy)
+#if defined(__AVX2__) && !defined(DISABLE_SSE_BASE64_ENCODER_LEMIRE) ||  defined(__ARM_NEON) && !defined(DISABLE_SSE_BASE64_ENCODER_LEMIRE)
 thread_local std::string base64_buffer;
 // Lemire AVX2 base64 encoder - fastest implementation
 static constexpr char base64_chars[64] = {
