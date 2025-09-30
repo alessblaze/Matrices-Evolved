@@ -64,6 +64,14 @@ public:
     void verify(nb::bytes message, nb::bytes signature) const;
 };
 
+class VerifyKeyWithExpiry : public VerifyKey {
+public:
+    int expired = 0;
+    
+    VerifyKeyWithExpiry(const std::vector<uint8_t>& bytes, const std::string& algorithm = "ed25519", const std::string& ver = "1")
+        : VerifyKey(bytes, algorithm, ver) {}
+};
+
 class SigningKey {
 public:
     std::vector<uint8_t> key_bytes;

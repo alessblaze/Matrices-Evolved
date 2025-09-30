@@ -96,8 +96,19 @@ NB_MODULE(_event_signing_impl, m) {
              "bytes"_a, "alg"_a = "ed25519", "version"_a = "1")
         .def("encode", &VerifyKey::encode)
         .def("verify", &VerifyKey::verify)
+        .def("__eq__", [](const VerifyKey& self, const VerifyKey& other) {
+            return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version;
+        })
         .def_rw("alg", &VerifyKey::alg)
         .def_rw("version", &VerifyKey::version);
+    
+    nb::class_<VerifyKeyWithExpiry, VerifyKey>(m, "VerifyKeyWithExpiry")
+        .def(nb::init<const std::vector<uint8_t>&, const std::string&, const std::string&>(),
+             "bytes"_a, "alg"_a = "ed25519", "version"_a = "1")
+        .def("__eq__", [](const VerifyKeyWithExpiry& self, const VerifyKey& other) {
+            return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version;
+        })
+        .def_rw("expired", &VerifyKeyWithExpiry::expired);
     
     nb::class_<SigningKey>(m, "SigningKey")
         .def(nb::init<const std::vector<uint8_t>&, const std::string&, const std::string&>(),
@@ -139,7 +150,10 @@ NB_MODULE(_event_signing_impl, m) {
     m.def("get_verify_key", [](const SigningKey& signing_key) {
         return signing_key.get_verify_key();
     });
-    m.def("get_verify_key", &get_verify_key);  // Keep original for backward compatibility
+    m.def("get_verify_key", [](const std::vector<uint8_t>& signing_key_bytes) {
+        auto verify_key_bytes = get_verify_key(signing_key_bytes);
+        return VerifyKey(verify_key_bytes, "ed25519", "1");
+    });  // Return VerifyKey object for compatibility
     m.def("encode_base64_fast", [](nb::bytes data) {
         const char* ptr = static_cast<const char*>(data.c_str());
         size_t size = data.size();
@@ -233,26 +247,48 @@ NB_MODULE(_event_signing_impl, m) {
     m.def("encode_verify_key_base64", [](const std::vector<uint8_t>& key_bytes) {
         return nb::str(base64_encode(key_bytes).c_str());
     });
+    m.def("encode_verify_key_base64", [](const VerifyKey& verify_key) {
+        nb::bytes encoded = verify_key.encode();
+        const char* ptr = static_cast<const char*>(encoded.c_str());
+        size_t size = encoded.size();
+        std::vector<uint8_t> key_bytes(ptr, ptr + size);
+        return nb::str(base64_encode(key_bytes).c_str());
+    });
+    m.def("encode_verify_key_base64", [](const nb::object& key) {
+        // Handle any object with encode() method (nacl.signing.VerifyKey compatibility)
+        nb::bytes encoded = nb::cast<nb::bytes>(key.attr("encode")());
+        const char* ptr = static_cast<const char*>(encoded.c_str());
+        size_t size = encoded.size();
+        std::vector<uint8_t> key_bytes(ptr, ptr + size);
+        return nb::str(base64_encode(key_bytes).c_str());
+    });
     m.def("encode_signing_key_base64", [](const std::vector<uint8_t>& key_bytes) {
+        return nb::str(base64_encode(key_bytes).c_str());
+    });
+    m.def("encode_signing_key_base64", [](const SigningKey& signing_key) {
+        nb::bytes encoded = signing_key.encode();
+        const char* ptr = static_cast<const char*>(encoded.c_str());
+        size_t size = encoded.size();
+        std::vector<uint8_t> key_bytes(ptr, ptr + size);
         return nb::str(base64_encode(key_bytes).c_str());
     });
     m.def("decode_verify_key_base64", [](const std::string& algorithm, const std::string& version, const std::string& key_base64) {
         if (algorithm != "ed25519") throw std::runtime_error("Unsupported algorithm");
         auto key_bytes = base64_decode(key_base64);
         if (key_bytes.size() != 32) throw std::runtime_error("Invalid key length");
-        return key_bytes;
+        return VerifyKey(key_bytes, algorithm, version);
     });
     m.def("decode_signing_key_base64", [](const std::string& algorithm, const std::string& version, const std::string& key_base64) {
         if (algorithm != "ed25519") throw std::runtime_error("Unsupported algorithm");
         auto key_bytes = base64_decode(key_base64);
         if (key_bytes.size() != 32) throw std::runtime_error("Invalid key length");
-        return key_bytes;
+        return SigningKey(key_bytes, algorithm, version);
     });
     m.def("decode_verify_key_bytes_fast", [](std::string_view key_id, const std::vector<uint8_t>& key_bytes) {
         if (key_id.starts_with("ed25519:") && key_bytes.size() == 32) return key_bytes;
         throw std::runtime_error("Unsupported key type or invalid key length");
     });
-    m.def("decode_verify_key_bytes", [](std::string_view key_id, const nb::object& key_data) -> VerifyKey {
+    m.def("decode_verify_key_bytes", [](std::string_view key_id, const nb::object& key_data) -> VerifyKeyWithExpiry {
         std::vector<uint8_t> key_bytes;
         
         if (nb::isinstance<nb::bytes>(key_data)) {
@@ -267,7 +303,7 @@ NB_MODULE(_event_signing_impl, m) {
         if (key_id.starts_with("ed25519:") && key_bytes.size() == 32) {
             size_t colon_pos = key_id.find(':');
             std::string version = (colon_pos != std::string::npos) ? std::string(key_id.substr(colon_pos + 1)) : "1";
-            return VerifyKey(key_bytes, "ed25519", version);
+            return VerifyKeyWithExpiry(key_bytes, "ed25519", version);
         }
         throw std::runtime_error("Unsupported key type or invalid key length");
     });
@@ -298,10 +334,21 @@ NB_MODULE(_event_signing_impl, m) {
         return ids;
     });
     // Alias functions to match Rust API exactly
-    m.def("sign_json", [](const nb::dict& json_object, const std::string& signature_name, const nb::object& signing_key) {
-        std::string alg = nb::cast<std::string>(signing_key.attr("alg"));
-        std::string version = nb::cast<std::string>(signing_key.attr("version"));
-        std::string key_id = alg + ":" + version;
+    m.def("sign_json", [](nb::dict& json_object, const std::string& signature_name, const nb::object& signing_key) -> nb::dict {
+        std::string alg, version, key_id;
+        
+        // Try to get alg and version attributes (our SigningKey objects)
+        try {
+            alg = nb::cast<std::string>(signing_key.attr("alg"));
+            version = nb::cast<std::string>(signing_key.attr("version"));
+            key_id = alg + ":" + version;
+        } catch (const std::exception&) {
+            // Fallback for nacl.signing.SigningKey objects (no alg/version attributes)
+            alg = "ed25519";
+            version = "1";  // default version
+            key_id = "ed25519:1";
+        }
+        
         nb::bytes encoded_key = nb::cast<nb::bytes>(signing_key.attr("encode")());
         
         // Convert nb::bytes to std::vector<uint8_t>
@@ -309,7 +356,16 @@ NB_MODULE(_event_signing_impl, m) {
         size_t size = encoded_key.size();
         std::vector<uint8_t> signing_key_bytes(ptr, ptr + size);
         
-        return sign_json_object_fast(json_object, signature_name, signing_key_bytes, key_id);
+        nb::dict signed_dict = sign_json_object_fast(json_object, signature_name, signing_key_bytes, key_id);
+        
+        // Modify original dictionary in-place to match signedjson behavior
+        json_object.clear();
+        for (auto item : signed_dict) {
+            json_object[item.first] = item.second;
+        }
+        
+        // Return the signed dictionary for compatibility with Synapse's compute_event_signature
+        return signed_dict;
     });
     m.def("verify_signature", [](const std::vector<uint8_t>& json_bytes, const std::string& signature_b64, const std::vector<uint8_t>& verify_key_bytes) {
         return verify_signature_fast(std::span<const uint8_t>(json_bytes), signature_b64, verify_key_bytes);
@@ -327,7 +383,7 @@ NB_MODULE(_event_signing_impl, m) {
             version = "auto";
             DEBUG_LOG("Got raw bytes, length=" + std::to_string(verify_key_bytes.size()));
             
-            // Extract version from signatures if available
+            // Extract version from signatures if available (match Rust logic)
             if (json_dict.contains("signatures")) {
                 nb::dict signatures = json_dict["signatures"];
                 if (signatures.contains(signature_name.c_str())) {
@@ -338,6 +394,7 @@ NB_MODULE(_event_signing_impl, m) {
                             size_t colon_pos = key_id.find(':');
                             if (colon_pos != std::string::npos) {
                                 version = key_id.substr(colon_pos + 1);
+                                DEBUG_LOG("Using version from signatures: " + version);
                             }
                             break;
                         }
@@ -453,7 +510,14 @@ NB_MODULE(_event_signing_impl, m) {
         DEBUG_LOG("Signature verification completed successfully");
     });
     // Key management functions with version parameter (ignores version for compatibility)
-    m.def("generate_signing_key", [](const std::string& version) { return generate_signing_key(); });
+    m.def("generate_signing_key", [](const std::string& version) { 
+        auto key_bytes = generate_signing_key();
+        return SigningKey(key_bytes, "ed25519", version);
+    });
+    m.def("generate_signing_key", []() { 
+        auto key_bytes = generate_signing_key();
+        return SigningKey(key_bytes, "ed25519", "1");
+    });
     m.def("read_signing_keys", [](const nb::object& input_data) {
         DEBUG_LOG("read_signing_keys called");
         
