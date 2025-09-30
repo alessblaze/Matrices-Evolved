@@ -7,8 +7,10 @@ echo "Building and publishing matrices_evolved..."
 rm -rf dist/ build/ wheelhouse/
 
 # Build wheel
+echo "Building python3.11 wheel"
 python3.11 -m build --wheel
-
+echo "Building python3.10 wheel"
+python3 -m build --wheel
 # Install auditwheel if not present
 python3.11 -m pip install auditwheel twine
 
