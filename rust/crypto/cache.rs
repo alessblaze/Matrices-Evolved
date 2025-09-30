@@ -145,6 +145,8 @@ pub struct UnifiedCache {
     lru_nodes: FastHashMap<Arc<CacheKey>, Box<LruNode>>,
     head: Option<Arc<CacheKey>>,
     tail: Option<Arc<CacheKey>>,
+    size_callback: Option<Py<PyAny>>,
+    current_size: usize,
 }
 
 impl UnifiedCache {
@@ -164,6 +166,8 @@ impl UnifiedCache {
             lru_nodes: FastHashMap::default(),
             head: None,
             tail: None,
+            size_callback: None,
+            current_size: 0,
         }
     }
 
@@ -391,13 +395,19 @@ impl UnifiedCache {
     /// Invalidates all cache entries that have the specified prefix.
     /// Removes all children from the hierarchy and returns the removed entries.
     /// Time complexity: O(children) where children is the number of matching entries.
-    fn invalidate_prefix(&mut self, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
+    fn invalidate_prefix(&mut self, py: Python, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
         let mut removed_entries = Vec::new();
         
         if let Some(children) = self.hierarchy.get(prefix_key) {
             let child_keys: Vec<_> = children.keys().cloned().collect();
             for child_key in child_keys {
                 if let Some(entry) = self.data.remove(&child_key) {
+                    // Update size tracking for removed entry
+                    if self.size_callback.is_some() {
+                        let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
+                        self.current_size = self.current_size.saturating_sub(entry_size);
+                    }
+                    
                     self.remove_from_lru(&child_key);
                     removed_entries.push((child_key, entry));
                 }
@@ -416,6 +426,12 @@ impl UnifiedCache {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         
         if let Some(entry) = self.data.remove(&cache_key) {
+            // Update size tracking for removed entry
+            if self.size_callback.is_some() {
+                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
+                self.current_size = self.current_size.saturating_sub(entry_size);
+            }
+            
             self.remove_from_lru(&cache_key);
             self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
             Ok((entry.value, entry.callbacks))
@@ -433,6 +449,13 @@ impl UnifiedCache {
         let lru_key = self.remove_lru()?;
         rust_debug_fast!("popitem() removing LRU key: {:?}", lru_key);
         let entry = self.data.remove(&lru_key)?;
+        
+        // Update size tracking for removed entry
+        if self.size_callback.is_some() {
+            let entry_size = self.calculate_size(_py, &entry.value).unwrap_or(1);
+            self.current_size = self.current_size.saturating_sub(entry_size);
+        }
+        
         self.remove_hierarchy_fast(&lru_key, entry.prefix_arcs.as_ref());
         rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.callbacks.len());
         Some((entry.original_key, entry.value, entry.callbacks))
@@ -450,6 +473,21 @@ impl UnifiedCache {
         
         if self.data.contains_key(&cache_key) {
             rust_debug_fast!("Key exists, updating entry");
+            
+            // Calculate sizes before getting mutable reference
+            let (old_size, new_size) = if self.size_callback.is_some() {
+                let old_val = self.data.get(&cache_key).map(|e| &e.value);
+                let old_size = if let Some(old_val) = old_val {
+                    self.calculate_size(py, old_val).unwrap_or(1)
+                } else {
+                    1
+                };
+                let new_size = self.calculate_size(py, &value).unwrap_or(1);
+                (old_size, new_size)
+            } else {
+                (0, 0)
+            };
+            
             if let Some(entry) = self.data.get_mut(&cache_key) {
                 // Check if value changed and run callbacks if so (Python LruCache behavior)
                 let value_changed = !entry.value.bind(py).eq(&value.bind(py)).unwrap_or(false);
@@ -461,6 +499,11 @@ impl UnifiedCache {
                         }
                     }
                     entry.callbacks.clear(); // Clear callbacks after execution
+                }
+                
+                // Update size tracking for existing entry
+                if self.size_callback.is_some() {
+                    self.current_size = self.current_size.saturating_sub(old_size).saturating_add(new_size);
                 }
                 
                 entry.value = value;
@@ -479,9 +522,16 @@ impl UnifiedCache {
             }
         } else {
             rust_debug_fast!("New key, inserting entry");
-            // Evict LRU entries until we have space
-            while self.data.len() >= self.capacity {
-                rust_debug_fast!("Cache full, evicting LRU entry. Current size: {}, capacity: {}", self.data.len(), self.capacity);
+            // Calculate new entry size for eviction logic
+            let new_entry_size = if self.size_callback.is_some() {
+                self.calculate_size(py, &value).unwrap_or(1)
+            } else {
+                1
+            };
+            
+            // Evict LRU entries until we have space for the new entry
+            while self.len() + new_entry_size > self.capacity {
+                rust_debug_fast!("Cache full, evicting LRU entry. Current size: {}, new entry size: {}, capacity: {}", self.len(), new_entry_size, self.capacity);
                 if let Some((_, _, callbacks)) = self.popitem(py) {
                     rust_debug_fast!("Evicted entry with {} callbacks", callbacks.len());
                     evicted_callbacks.extend(callbacks);
@@ -492,6 +542,12 @@ impl UnifiedCache {
             }
             
             let prefix_arcs = self.add_hierarchy(&cache_key);
+            
+            // Update size tracking for new entry (size already calculated above)
+            if self.size_callback.is_some() {
+                self.current_size = self.current_size.saturating_add(new_entry_size);
+            }
+            
             let entry = CacheEntry {
                 value,
                 callbacks,
@@ -576,6 +632,13 @@ impl UnifiedCache {
         
         if let Some(entry) = self.data.remove(&cache_key) {
             rust_debug_fast!("Entry found, removing from cache and LRU");
+            
+            // Update size tracking for removed entry
+            if self.size_callback.is_some() {
+                let entry_size = self.calculate_size(_py, &entry.value).unwrap_or(1);
+                self.current_size = self.current_size.saturating_sub(entry_size);
+            }
+            
             self.remove_from_lru(&cache_key);
             self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
             Ok((true, entry.callbacks))
@@ -589,7 +652,7 @@ impl UnifiedCache {
     /// Collects all callbacks from removed entries for execution.
     /// Time complexity: O(n) where n is the number of cache entries.
     pub fn clear(&mut self, py: Python) -> (usize, Vec<Py<PyAny>>) {
-        let count = self.data.len();
+        let count = self.len();
         rust_debug_fast!("UnifiedCache::clear() called for cache '{}' with {} entries", self.name, count);
         
         let mut all_callbacks = Vec::new();
@@ -604,6 +667,7 @@ impl UnifiedCache {
         self.lru_nodes.clear();
         self.head = None;
         self.tail = None;
+        self.current_size = 0;
         
         rust_debug_fast!("UnifiedCache::clear() completed for cache '{}', cleared {} entries, {} callbacks", self.name, count, all_callbacks.len());
         (count, all_callbacks)
@@ -612,7 +676,11 @@ impl UnifiedCache {
     /// Returns the current number of entries in the cache.
     /// Time complexity: O(1).
     pub fn len(&self) -> usize {
-        self.data.len()
+        if self.size_callback.is_some() {
+            self.current_size
+        } else {
+            self.data.len()
+        }
     }
     
     /// Checks if a key exists in the cache without updating LRU position.
@@ -626,6 +694,23 @@ impl UnifiedCache {
     /// Time complexity: O(1).
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+    
+    /// Sets the size callback for calculating entry sizes.
+    pub fn set_size_callback(&mut self, callback: Option<Py<PyAny>>) {
+        self.size_callback = callback;
+        // Reset current size when callback changes
+        self.current_size = 0;
+    }
+    
+    /// Calculates the size of a value using the size callback.
+    fn calculate_size(&self, py: Python, value: &Py<PyAny>) -> PyResult<usize> {
+        if let Some(ref callback) = self.size_callback {
+            let result = callback.bind(py).call1((value,))?;
+            Ok(result.extract()?)
+        } else {
+            Ok(1)
+        }
     }
     
     /// Checks and repairs cache consistency between data and lru_nodes.
@@ -746,12 +831,13 @@ impl RustLruCache {
     /// Creates a new thread-safe Rust LRU cache with the specified configuration.
     /// Wraps UnifiedCache in Arc<Mutex<>> for safe concurrent access from Python.
     #[new]
-    #[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None))]
+    #[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None, size_callback=None))]
     fn new(
         max_size: usize, 
         cache_name: Option<String>, 
         metrics: Option<Py<PyAny>>,
-        callback_policy: Option<String>
+        callback_policy: Option<String>,
+        size_callback: Option<Py<PyAny>>
     ) -> Self {
         let name = cache_name.unwrap_or_else(|| "rust_cache".to_string());
         let policy = match callback_policy.as_deref() {
@@ -759,6 +845,11 @@ impl RustLruCache {
             _ => CallbackPolicy::Replace,
         };
         let cache = Arc::new(RwLock::new(UnifiedCache::new(name.clone(), max_size, metrics, policy)));
+        
+        // Set size callback if provided
+        if let Some(callback) = size_callback {
+            cache.write().set_size_callback(Some(callback));
+        }
         
         Self { cache, name }
     }
@@ -823,7 +914,7 @@ impl RustLruCache {
         let mut all_callbacks = Vec::new();
         let count = {
             let mut cache = self.cache.write();
-            let removed_entries = cache.invalidate_prefix(&cache_key);
+            let removed_entries = cache.invalidate_prefix(py, &cache_key);
             let entry_count = removed_entries.len();
             
             for (_, entry) in removed_entries {
@@ -990,6 +1081,13 @@ impl RustLruCache {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         Ok(self.cache.read().contains(&cache_key))
     }
+    
+    /// Sets the size callback for calculating entry sizes.
+    fn set_size_callback(&self, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        let mut cache = self.cache.write();
+        cache.set_size_callback(callback);
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -1141,14 +1239,15 @@ impl AsyncRustLruCache {
 /// Factory function to create a new RustLruCache instance from Python.
 /// Provides a convenient interface for Python code to instantiate the cache.
 #[pyfunction]
-#[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None))]
+#[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None, size_callback=None))]
 pub fn create_rust_lru_cache(
     max_size: usize, 
     cache_name: Option<String>, 
     metrics: Option<Py<PyAny>>,
-    callback_policy: Option<String>
+    callback_policy: Option<String>,
+    size_callback: Option<Py<PyAny>>
 ) -> PyResult<RustLruCache> {
-    Ok(RustLruCache::new(max_size, cache_name, metrics, callback_policy))
+    Ok(RustLruCache::new(max_size, cache_name, metrics, callback_policy, size_callback))
 }
 
 #[pyfunction]
