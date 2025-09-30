@@ -172,12 +172,15 @@ impl UnifiedCache {
     /// Returns true if the key was found and moved, false otherwise.
     /// Time complexity: O(1).
     fn move_to_front(&mut self, key: &Arc<CacheKey>) -> bool {
+        rust_debug_fast!("move_to_front() called for key: {:?}", key);
         // Consistency check: key must exist in both data and lru_nodes
         if !self.data.contains_key(key) || !self.lru_nodes.contains_key(key) {
+            rust_debug_fast!("move_to_front() failed: key not found in data or lru_nodes");
             return false;
         }
         
         if self.head.as_ref() == Some(key) {
+            rust_debug_fast!("move_to_front() key already at head");
             return true;
         }
         
@@ -407,16 +410,17 @@ impl UnifiedCache {
     
     /// Removes and returns a cache entry, or returns default if not found.
     /// Uses stored prefix references for O(k) cleanup without allocations.
+    /// Returns (value, callbacks) tuple for callback execution.
     /// Time complexity: O(k) where k is tuple length.
-    pub fn pop(&mut self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    pub fn pop(&mut self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<(Py<PyAny>, Vec<Py<PyAny>>)> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         
         if let Some(entry) = self.data.remove(&cache_key) {
             self.remove_from_lru(&cache_key);
             self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
-            Ok(entry.value)
+            Ok((entry.value, entry.callbacks))
         } else {
-            Ok(default.unwrap_or_else(|| py.None()))
+            Ok((default.unwrap_or_else(|| py.None()), Vec::new()))
         }
     }
     
@@ -425,9 +429,12 @@ impl UnifiedCache {
     /// Returns (original_key, value, callbacks) tuple.
     /// Time complexity: O(k) where k is tuple length for hierarchy cleanup.
     fn popitem(&mut self, _py: Python) -> Option<(Py<PyAny>, Py<PyAny>, Vec<Py<PyAny>>)> {
+        rust_debug_fast!("popitem() called, tail: {:?}", self.tail);
         let lru_key = self.remove_lru()?;
+        rust_debug_fast!("popitem() removing LRU key: {:?}", lru_key);
         let entry = self.data.remove(&lru_key)?;
         self.remove_hierarchy_fast(&lru_key, entry.prefix_arcs.as_ref());
+        rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.callbacks.len());
         Some((entry.original_key, entry.value, entry.callbacks))
     }
     
@@ -444,11 +451,27 @@ impl UnifiedCache {
         if self.data.contains_key(&cache_key) {
             rust_debug_fast!("Key exists, updating entry");
             if let Some(entry) = self.data.get_mut(&cache_key) {
-                entry.value = value;
-                match self.callback_policy {
-                    CallbackPolicy::Replace => entry.callbacks = callbacks,
-                    CallbackPolicy::Append => entry.callbacks.extend(callbacks),
+                // Check if value changed and run callbacks if so (Python LruCache behavior)
+                let value_changed = !entry.value.bind(py).eq(&value.bind(py)).unwrap_or(false);
+                if value_changed {
+                    // Execute existing callbacks before updating
+                    for callback in &entry.callbacks {
+                        if let Err(e) = callback.bind(py).call0() {
+                            rust_debug_fast!("Callback execution error: {}", e);
+                        }
+                    }
+                    entry.callbacks.clear(); // Clear callbacks after execution
                 }
+                
+                entry.value = value;
+                // Only update callbacks if new callbacks are provided
+                if !callbacks.is_empty() {
+                    match self.callback_policy {
+                        CallbackPolicy::Replace => entry.callbacks = callbacks,
+                        CallbackPolicy::Append => entry.callbacks.extend(callbacks),
+                    }
+                }
+                // If callbacks is empty, preserve existing callbacks (Python LruCache behavior)
             }
             
             if !self.move_to_front(&cache_key) {
@@ -456,10 +479,15 @@ impl UnifiedCache {
             }
         } else {
             rust_debug_fast!("New key, inserting entry");
-            if self.data.len() >= self.capacity {
-                rust_debug_fast!("Cache full, evicting LRU entry");
+            // Evict LRU entries until we have space
+            while self.data.len() >= self.capacity {
+                rust_debug_fast!("Cache full, evicting LRU entry. Current size: {}, capacity: {}", self.data.len(), self.capacity);
                 if let Some((_, _, callbacks)) = self.popitem(py) {
-                    evicted_callbacks = callbacks;
+                    rust_debug_fast!("Evicted entry with {} callbacks", callbacks.len());
+                    evicted_callbacks.extend(callbacks);
+                } else {
+                    rust_debug_fast!("popitem() returned None, breaking eviction loop");
+                    break; // No more entries to evict
                 }
             }
             
@@ -482,7 +510,7 @@ impl UnifiedCache {
     /// Retrieves a cache entry and updates its LRU position.
     /// Records cache hit/miss metrics if metrics are configured.
     /// Time complexity: O(1) for HashMap lookup and LRU update.
-    pub fn get(&mut self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    pub fn get(&mut self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Option<Py<PyAny>>> {
         rust_debug_fast!("UnifiedCache::get() called");
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         
@@ -502,9 +530,23 @@ impl UnifiedCache {
             }
         }
         
-        if let Some(entry) = self.data.get(&cache_key) {
+        if let Some(entry) = self.data.get_mut(&cache_key) {
             rust_debug_fast!("Cache hit, returning value");
             let value = entry.value.clone_ref(py);
+            
+            // Add callbacks if provided (Python LruCache behavior)
+            if let Some(new_callbacks) = callbacks {
+                // Always process callbacks, even if empty (matches Python behavior)
+                match self.callback_policy {
+                    CallbackPolicy::Replace => {
+                        if !new_callbacks.is_empty() {
+                            entry.callbacks = new_callbacks;
+                        }
+                        // If empty, preserve existing callbacks (Python add_callbacks behavior)
+                    },
+                    CallbackPolicy::Append => entry.callbacks.extend(new_callbacks),
+                }
+            }
             
             if !self.move_to_front(&cache_key) {
                 // If move_to_front fails, try adding to front as fallback
@@ -729,9 +771,10 @@ impl RustLruCache {
     
     /// Retrieves a value from the cache, returning default if not found.
     /// Thread-safe wrapper around UnifiedCache::get with mutex locking.
-    fn get(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (key, default=None, callbacks=None))]
+    fn get(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Py<PyAny>> {
         let mut cache = self.cache.write();
-        match cache.get(py, key)? {
+        match cache.get(py, key, callbacks)? {
             Some(value) => Ok(value),
             None => Ok(default.unwrap_or_else(|| py.None()))
         }
@@ -800,10 +843,20 @@ impl RustLruCache {
     }
     
     /// Removes and returns a cache entry, or returns default if not found.
-    /// Direct delegation to UnifiedCache::pop with mutex protection.
+    /// Executes callbacks associated with the removed entry.
     fn pop(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let mut cache = self.cache.write();
-        cache.pop(py, key, default)
+        let (value, callbacks) = {
+            let mut cache = self.cache.write();
+            cache.pop(py, key, default)?
+        };
+        
+        for callback in callbacks {
+            if let Err(e) = callback.bind(py).call0() {
+                eprintln!("Cache callback error: {}", e);
+            }
+        }
+        
+        Ok(value)
     }
     
     /// Removes all cache entries and executes all associated callbacks.
@@ -826,7 +879,7 @@ impl RustLruCache {
     /// TreeCache compatibility method - delegates to standard get().
     /// Provided for Python wrapper compatibility with tuple keys.
     fn get_with_tuple(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        self.get(py, key, default)
+        self.get(py, key, default, None)
     }
     
     /// TreeCache compatibility method - delegates to standard set().
@@ -880,7 +933,7 @@ impl RustLruCache {
     /// Python dict[key] support - returns value or raises KeyError.
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let mut cache = self.cache.write();
-        match cache.get(py, key)? {
+        match cache.get(py, key, None)? {
             Some(value) => Ok(value),
             None => Err(pyo3::exceptions::PyKeyError::new_err("Key not found"))
         }
@@ -975,7 +1028,7 @@ impl AsyncRustLruCache {
             let mut cache = cache.write().await;
             Python::with_gil(|py| {
                 let key_bound = key.bind(py);
-                match cache.get(py, &key_bound)? {
+                match cache.get(py, &key_bound, None)? {
                     Some(value) => Ok(value),
                     None => Ok(default.unwrap_or_else(|| py.None()))
                 }

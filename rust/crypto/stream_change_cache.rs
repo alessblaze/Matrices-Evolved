@@ -459,24 +459,78 @@ impl RustStreamChangeCache {
             self.metrics.hits(), self.metrics.misses(), self.metrics.stale()
         )
     }
+    
+    #[getter]
+    fn _entity_to_key(&self, py: Python) -> PyResult<PyObject> {
+        let state = self.state.read();
+        let dict = pyo3::types::PyDict::new(py);
+        for (k, &v) in state.entity_to_key.iter() {
+            dict.set_item(k.as_ref(), v)?;
+        }
+        Ok(dict.into())
+    }
+    
+    #[getter] 
+    fn _cache(&self, py: Python) -> PyResult<PyObject> {
+        let state = self.state.read();
+        let dict = pyo3::types::PyDict::new(py);
+        for (&k, v) in state.cache.iter() {
+            let entities: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+            let py_set = PySet::new(py, &entities)?;
+            dict.set_item(k, py_set)?;
+        }
+        Ok(dict.into())
+    }
+    
+    #[getter]
+    fn _earliest_known_stream_pos(&self) -> i64 {
+        self.state.read().earliest_known_stream_pos
+    }
+    
+    fn get_cache_dict(&self, py: Python) -> PyResult<PyObject> {
+        let state = self.state.read();
+        let dict = pyo3::types::PyDict::new(py);
+        for (&k, v) in state.cache.iter() {
+            let entities: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+            let py_set = PySet::new(py, &entities)?;
+            dict.set_item(k, py_set)?;
+        }
+        Ok(dict.into())
+    }
+    
+    fn get_entity_to_key_dict(&self, py: Python) -> PyResult<PyObject> {
+        let state = self.state.read();
+        let dict = pyo3::types::PyDict::new(py);
+        for (k, &v) in state.entity_to_key.iter() {
+            dict.set_item(k.as_ref(), v)?;
+        }
+        Ok(dict.into())
+    }
+    
+    #[getter]
+    fn cache(&self, py: Python) -> PyResult<PyObject> {
+        self.get_cache_dict(py)
+    }
+    
+    #[getter]
+    fn entity_to_key(&self, py: Python) -> PyResult<PyObject> {
+        self.get_entity_to_key_dict(py)
+    }
 }
 
 impl RustStreamChangeCache {
     fn evict_locked(&self, state: &mut CacheState) {
         // Evict oldest entries if cache is too large (by positions or total entities)
-        let mut last_evicted: Option<i64> = None;
         while state.cache.len() > state.max_positions || state.entity_to_key.len() > MAX_ENTITIES_TOTAL {
             if let Some((old_stream_pos, old_entities)) = state.cache.pop_first() {
-                last_evicted = Some(old_stream_pos);
+                // Update earliest known position to match Python implementation
+                state.earliest_known_stream_pos = state.earliest_known_stream_pos.max(old_stream_pos);
                 for entity in old_entities {
                     state.entity_to_key.remove(&entity);
                 }
             } else {
                 break;
             }
-        }
-        if let Some(pos) = last_evicted {
-            state.earliest_known_stream_pos = pos + 1;
         }
     }
 }
