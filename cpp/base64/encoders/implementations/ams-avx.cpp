@@ -506,7 +506,10 @@ you can feed those 6-bit values directly into the reduced nibble calculation, th
 then add to get ASCII—completely bypassing any need for the Muła–Lemire unpacking/extraction stage. 
 Their extraction method involves more complex permutations and bit-field assembly because they're 
 working from a different input layout, but we've already solved that part with PMADDUBSW.
-
+If sextets are currently carried in 16‑bit or 32‑bit elements, narrow them to bytes before character mapping 
+(e.g., with VPACKUS or bytewise masks/shifts), but this is just width narrowing, not the Muła–Lemire “pack indices” 
+stage the reduced‑nibble mapping replaces. Once sextets are bytes masked to 0x3F, the reduced‑nibble key, 
+16‑byte VPSHUFB of offsets, and VPADDB yield ASCII directly without any further index packing
 
 */
 

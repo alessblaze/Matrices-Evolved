@@ -136,7 +136,10 @@ NB_MODULE(_event_signing_impl, m) {
     m.def("verify_signature_with_info", &verify_signature_with_info);
     m.def("sign_json_object_fast", &sign_json_object_fast);
     m.def("verify_signed_json_fast", &verify_signed_json_fast);
-    m.def("get_verify_key", &get_verify_key);
+    m.def("get_verify_key", [](const SigningKey& signing_key) {
+        return signing_key.get_verify_key();
+    });
+    m.def("get_verify_key", &get_verify_key);  // Keep original for backward compatibility
     m.def("encode_base64_fast", [](nb::bytes data) {
         const char* ptr = static_cast<const char*>(data.c_str());
         size_t size = data.size();
@@ -160,8 +163,71 @@ NB_MODULE(_event_signing_impl, m) {
             return nb::str(base64_encode(vec_data).c_str());
         }
     });
+    // Synapse-compatible overload with urlsafe parameter
+    m.def("encode_base64", [](nb::bytes data, bool urlsafe = false) {
+        const char* ptr = static_cast<const char*>(data.c_str());
+        size_t size = data.size();
+        std::vector<uint8_t> vec_data(ptr, ptr + size);
+        std::string result = base64_encode(vec_data);
+        
+        // Convert to URL-safe if requested (replace + with -, / with _)
+        if (urlsafe) {
+            std::replace(result.begin(), result.end(), '+', '-');
+            std::replace(result.begin(), result.end(), '/', '_');
+        }
+        
+        return nb::str(result.c_str());
+    }, "input_bytes"_a, "urlsafe"_a = false);
+    // Additional overload for vector input (Synapse compatibility)
+    m.def("encode_base64", [](const std::vector<uint8_t>& data, bool urlsafe = false) {
+        std::string result = base64_encode(data);
+        
+        // Convert to URL-safe if requested
+        if (urlsafe) {
+            std::replace(result.begin(), result.end(), '+', '-');
+            std::replace(result.begin(), result.end(), '/', '_');
+        }
+        
+        return nb::str(result.c_str());
+    }, "input_bytes"_a, "urlsafe"_a = false);
+    // Padded base64 encoding function
+    m.def("encode_base64_padded", [](nb::bytes data, bool urlsafe = false) {
+        const char* ptr = static_cast<const char*>(data.c_str());
+        size_t size = data.size();
+        std::vector<uint8_t> vec_data(ptr, ptr + size);
+        std::string result = base64_encode(vec_data);
+        
+        // Add padding
+        size_t padding_needed = (4 - (result.length() % 4)) % 4;
+        result.append(padding_needed, '=');
+        
+        // Convert to URL-safe if requested
+        if (urlsafe) {
+            std::replace(result.begin(), result.end(), '+', '-');
+            std::replace(result.begin(), result.end(), '/', '_');
+        }
+        
+        return nb::str(result.c_str());
+    }, "input_bytes"_a, "urlsafe"_a = false);
     m.def("decode_base64", [](const std::string& encoded) {
         auto result = base64_decode(encoded);
+        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
+    });
+    // Padded base64 decoding function
+    m.def("decode_base64_padded", [](const std::string& encoded) {
+        std::string input = encoded;
+        
+        // Convert URL-safe characters back to standard base64
+        std::replace(input.begin(), input.end(), '-', '+');
+        std::replace(input.begin(), input.end(), '_', '/');
+        
+        // Remove existing padding
+        while (!input.empty() && input.back() == '=') {
+            input.pop_back();
+        }
+        
+        // Use existing base64_decode which handles unpadded input
+        auto result = base64_decode(input);
         return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
     });
     m.def("encode_verify_key_base64", [](const std::vector<uint8_t>& key_bytes) {
