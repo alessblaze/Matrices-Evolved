@@ -38,6 +38,7 @@ tokio = { version = "1.0", features = ["sync"] }
 rustc-hash = "2.1.1"  
 parking_lot = "0.12"
 ryu = "=1.0.20"
+num-bigint = "0.4"
 [profile.release]
 opt-level = 3
 lto = "fat"              # Full LTO for maximum optimization

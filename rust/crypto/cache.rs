@@ -24,6 +24,8 @@ use parking_lot::RwLock;
 use tokio::sync::RwLock as AsyncRwLock;
 use hashbrown::HashMap;
 use std::sync::{Arc, LazyLock};
+use num_bigint::BigInt;
+use std::hash::{Hash, Hasher};
 
 // Cached debug flag for optimal performance
 static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("SYNAPSE_RUST_CACHE_DEBUG").is_ok());
@@ -41,14 +43,55 @@ macro_rules! rust_debug_fast {
 
 type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub(crate) enum CacheKey {
     String(String),
-    Int(i64),
-    Bool(bool),
+    IntSmall(i64),
+    IntBig(BigInt),
     None,
     Tuple(Box<[CacheKey]>),
     Hashed { type_name: String, hash: u64 },
+}
+
+// Custom Eq to unify small/large ints
+impl PartialEq for CacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        use CacheKey::*;
+        match (self, other) {
+            (IntSmall(a), IntSmall(b)) => a == b,
+            (IntBig(a), IntBig(b)) => a == b,
+            (IntSmall(a), IntBig(b)) | (IntBig(b), IntSmall(a)) => BigInt::from(*a) == *b,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other) && match (self, other) {
+                (String(a), String(b)) => a == b,
+                (Tuple(a), Tuple(b)) => a == b,
+                (None, None) => true,
+                (Hashed { type_name: ta, hash: ha }, Hashed { type_name: tb, hash: hb }) => ta == tb && ha == hb,
+                _ => false,
+            }
+        }
+    }
+}
+impl Eq for CacheKey {}
+
+// Custom Hash to make IntSmall/IntBig produce identical digests for equal values
+impl Hash for CacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        use CacheKey::*;
+        match self {
+            IntSmall(v) => {
+                state.write_u8(1);
+                BigInt::from(*v).hash(state);
+            }
+            IntBig(bi) => {
+                state.write_u8(1);
+                bi.hash(state);
+            }
+            String(s) => { state.write_u8(2); s.hash(state); }
+            Tuple(t) => { state.write_u8(3); t.hash(state); }
+            None => { state.write_u8(4); }
+            Hashed { type_name, hash } => { state.write_u8(5); type_name.hash(state); hash.hash(state); }
+        }
+    }
 }
 
 impl CacheKey {
@@ -64,10 +107,21 @@ impl CacheKey {
             return Ok(CacheKey::Tuple(Self::extract_tuple_parts(tuple)?));
         }
         if obj.is_instance_of::<PyBool>() {
-            return Ok(CacheKey::Bool(obj.extract()?));
+            // Normalize bools into the integer path
+            let b: bool = obj.extract()?;
+            return Ok(CacheKey::IntSmall(if b { 1 } else { 0 }));
         }
         if obj.is_instance_of::<PyInt>() {
-            return Ok(CacheKey::Int(obj.extract()?));
+            // Try small fast path
+            if let Ok(v) = obj.extract::<i64>() {
+                return Ok(CacheKey::IntSmall(v));
+            }
+            // Lossless big-int via decimal string -> BigInt
+            let s = obj.str()?.to_string();
+            let big = s.parse::<BigInt>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyTypeError, _>("Failed to parse Python int")
+            })?;
+            return Ok(CacheKey::IntBig(big));
         }
         if obj.is_instance_of::<PyString>() {
             return Ok(CacheKey::String(obj.extract()?));
@@ -359,15 +413,13 @@ impl UnifiedCache {
         let mut prefix_arcs = Vec::new();
         if let CacheKey::Tuple(parts) = key.as_ref() {
             for i in 1..parts.len() {
-                if i <= parts.len() {
-                    let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
-                    let prefix_arc = self.get_or_create_prefix(prefix);
-                    self.hierarchy
-                        .entry(prefix_arc.clone())
-                        .or_insert_with(FastHashMap::default)
-                        .insert(key.clone(), ());
-                    prefix_arcs.push(prefix_arc);
-                }
+                let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
+                let prefix_arc = self.get_or_create_prefix(prefix);
+                self.hierarchy
+                    .entry(prefix_arc.clone())
+                    .or_insert_with(FastHashMap::default)
+                    .insert(key.clone(), ());
+                prefix_arcs.push(prefix_arc);
             }
         }
         prefix_arcs
@@ -409,7 +461,29 @@ impl UnifiedCache {
                     }
                     
                     self.remove_from_lru(&child_key);
+                    // Clean up hierarchy state for each removed child
+                    self.remove_hierarchy_fast(&child_key, entry.prefix_arcs.as_ref());
                     removed_entries.push((child_key, entry));
+                } else {
+                    // Fallback: reconstruct arcs from the child key to release prefix refs
+                    if let CacheKey::Tuple(parts) = child_key.as_ref() {
+                        for i in 1..parts.len() {
+                            let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
+                            let prefix_arc = if let Some(a) = self.prefix_cache.get(&prefix) {
+                                a.clone()
+                            } else {
+                                Arc::new(prefix.clone())
+                            };
+                            if let Some(children_map) = self.hierarchy.get_mut(&prefix_arc) {
+                                children_map.remove(&child_key);
+                                if children_map.is_empty() {
+                                    self.hierarchy.remove(&prefix_arc);
+                                }
+                            }
+                            self.release_prefix(&prefix);
+                        }
+                    }
+                    self.remove_from_lru(&child_key);
                 }
             }
             self.hierarchy.remove(prefix_key);
@@ -697,10 +771,20 @@ impl UnifiedCache {
     }
     
     /// Sets the size callback for calculating entry sizes.
-    pub fn set_size_callback(&mut self, callback: Option<Py<PyAny>>) {
+    pub fn set_size_callback(&mut self, py: Python, callback: Option<Py<PyAny>>) {
+        let has_callback = callback.is_some();
         self.size_callback = callback;
-        // Reset current size when callback changes
-        self.current_size = 0;
+        
+        // Recompute current size from existing entries
+        if has_callback {
+            self.current_size = 0;
+            for entry in self.data.values() {
+                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
+                self.current_size = self.current_size.saturating_add(entry_size);
+            }
+        } else {
+            self.current_size = 0;
+        }
     }
     
     /// Calculates the size of a value using the size callback.
@@ -723,9 +807,10 @@ impl UnifiedCache {
         let data_keys: Vec<_> = self.data.keys().cloned().collect();
         for key in &data_keys {
             if !self.lru_nodes.contains_key(key) {
-                rust_debug_fast!("Consistency error: data key {:?} missing from lru_nodes", key);
-                // Remove from data to maintain consistency
-                self.data.remove(key);
+                rust_debug_fast!("Consistency error: data key {:?} missing from lru_nodes, reconstructing", key);
+                // Reconstruct missing LRU node instead of dropping data entry
+                let node = Box::new(LruNode { prev: None, next: None });
+                self.lru_nodes.insert(key.clone(), node);
                 inconsistent = true;
             }
         }
@@ -735,7 +820,7 @@ impl UnifiedCache {
         for key in &lru_keys {
             if !self.data.contains_key(key) {
                 rust_debug_fast!("Consistency error: lru_node key {:?} missing from data", key);
-                // Remove from lru_nodes to maintain consistency
+                // Remove orphaned lru_nodes
                 self.lru_nodes.remove(key);
                 inconsistent = true;
             }
@@ -747,13 +832,8 @@ impl UnifiedCache {
             self.head = None;
             self.tail = None;
             
-            // Collect keys first to avoid borrow checker issues
-            let valid_keys: Vec<_> = self.data.keys()
-                .filter(|key| self.lru_nodes.contains_key(*key))
-                .cloned()
-                .collect();
-            
-            // Rebuild LRU chain in arbitrary order (better than broken state)
+            // Rebuild LRU chain for all data entries (now all have nodes)
+            let valid_keys: Vec<_> = self.data.keys().cloned().collect();
             for key in valid_keys {
                 self.add_to_front(key);
             }
@@ -769,7 +849,7 @@ impl UnifiedCache {
         self.capacity = new_capacity;
         
         // Evict entries if we're over capacity
-        while self.data.len() > new_capacity {
+        while self.len() > new_capacity {
             if let Some((_, _, callbacks)) = self.popitem(py) {
                 evicted_callbacks.extend(callbacks);
             } else {
@@ -848,7 +928,9 @@ impl RustLruCache {
         
         // Set size callback if provided
         if let Some(callback) = size_callback {
-            cache.write().set_size_callback(Some(callback));
+            Python::with_gil(|py| {
+                cache.write().set_size_callback(py, Some(callback));
+            });
         }
         
         Self { cache, name }
@@ -1083,9 +1165,9 @@ impl RustLruCache {
     }
     
     /// Sets the size callback for calculating entry sizes.
-    fn set_size_callback(&self, callback: Option<Py<PyAny>>) -> PyResult<()> {
+    fn set_size_callback(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
         let mut cache = self.cache.write();
-        cache.set_size_callback(callback);
+        cache.set_size_callback(py, callback);
         Ok(())
     }
 }
