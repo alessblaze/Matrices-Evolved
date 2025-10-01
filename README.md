@@ -169,19 +169,7 @@ the bindings are already there but currently not written in api docs.
 
 # Synthetic Benchmarks
 ```
-Pure Python LRU:
-   synmark.suites.lrucache_auto: Mean +- std dev: 3.17 us +- 0.08 us
-   synmark.suites.lrucache_evict_auto: Mean +- std dev: 3.06 us +- 0.08 us
-   Rust Wrapper LRU:
-   synmark.suites.lrucache_auto: Mean +- std dev: 900 ns +- 19 ns
-   synmark.suites.lrucache_evict_auto: Mean +- std dev: 879 ns +- 20 ns
-
-Formula:
-   Improvement (%) = ((Python_time - Rust_time) / Python_time) × 100
-
-Results:
-    1. lrucache_auto:       ((3170 - 900) / 3170) × 100 ≈ 71.6% faster
-    2. lrucache_evict_auto: ((3060 - 879) / 3060) × 100 ≈ 71.3% faster
+Lru New results would be available after testing new changes.
 
 
 crypto:
