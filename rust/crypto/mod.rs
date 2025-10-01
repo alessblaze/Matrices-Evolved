@@ -57,6 +57,9 @@ pub use event_signing::{
     read_signing_keys,
     read_old_signing_keys,
     write_signing_keys,
+    VerifyKey,
+    VerifyKeyWithExpiry,
+    SigningKey,
 };
 
 pub use cache::{
@@ -75,6 +78,11 @@ pub use stream_change_cache::{
 
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Add key classes first
+    m.add_class::<VerifyKey>()?;
+    m.add_class::<VerifyKeyWithExpiry>()?;
+    m.add_class::<SigningKey>()?;
+    
     // _fast versions for wrapper compatibility
     m.add_function(wrap_pyfunction!(compute_content_hash_fast, m)?)?;
     m.add_function(wrap_pyfunction!(compute_event_reference_hash_fast, m)?)?;
