@@ -604,7 +604,7 @@ impl UnifiedCache {
             };
             
             // Evict LRU entries until we have space for the new entry
-            while self.len() + new_entry_size > self.capacity {
+            while (if self.size_callback.is_some() { self.current_size + new_entry_size } else { self.data.len() + 1 }) > self.capacity {
                 rust_debug_fast!("Cache full, evicting LRU entry. Current size: {}, new entry size: {}, capacity: {}", self.len(), new_entry_size, self.capacity);
                 if let Some((_, _, callbacks)) = self.popitem(py) {
                     rust_debug_fast!("Evicted entry with {} callbacks", callbacks.len());
@@ -849,7 +849,7 @@ impl UnifiedCache {
         self.capacity = new_capacity;
         
         // Evict entries if we're over capacity
-        while self.len() > new_capacity {
+        while (if self.size_callback.is_some() { self.current_size } else { self.data.len() }) > new_capacity {
             if let Some((_, _, callbacks)) = self.popitem(py) {
                 evicted_callbacks.extend(callbacks);
             } else {
@@ -858,6 +858,33 @@ impl UnifiedCache {
         }
         
         evicted_callbacks
+    }
+    
+    /// Atomic get-or-set operation - returns existing value or sets and returns new value.
+    /// Time complexity: O(1) for HashMap lookup, O(k) for hierarchy if new tuple key.
+    pub fn setdefault(&mut self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        
+        // Check if key exists first
+        if let Some(entry) = self.data.get(&cache_key) {
+            let existing_value = entry.value.clone_ref(py);
+            // Move to front after getting value
+            if !self.move_to_front(&cache_key) {
+                self.add_to_front(cache_key);
+            }
+            Ok(existing_value)
+        } else {
+            // Key doesn't exist, set it and return the value
+            let value_clone = value.clone_ref(py);
+            let evicted_callbacks = self.set(py, key, value_clone, Vec::new())?;
+            // Execute callbacks outside the method to avoid borrow issues
+            for callback in evicted_callbacks {
+                if let Err(e) = callback.bind(py).call0() {
+                    eprintln!("Cache callback error: {}", e);
+                }
+            }
+            Ok(value)
+        }
     }
     
     /// Gets all entries that have the given tuple prefix.
@@ -1094,7 +1121,12 @@ impl RustLruCache {
     
     /// Python len() support - returns current number of cache entries.
     fn __len__(&self) -> PyResult<usize> {
-        Ok(self.cache.read().len())
+        let cache = self.cache.read();
+        Ok(if cache.size_callback.is_some() {
+            cache.current_size
+        } else {
+            cache.data.len()
+        })
     }
     
     /// Python 'in' operator support - checks if key exists in cache.
@@ -1169,6 +1201,22 @@ impl RustLruCache {
         let mut cache = self.cache.write();
         cache.set_size_callback(py, callback);
         Ok(())
+    }
+    
+    /// Atomic get-or-set operation
+    fn setdefault(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let mut cache = self.cache.write();
+        cache.setdefault(py, key, value)
+    }
+    
+    /// TreeCache multi-get - returns iterator over prefix matches
+    fn get_multi(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
+        self.get_prefix_children(py, prefix_key)
+    }
+    
+    /// TreeCache multi-delete - removes all entries with prefix
+    fn del_multi(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<usize> {
+        self.invalidate_prefix(py, prefix_key)
     }
 }
 
