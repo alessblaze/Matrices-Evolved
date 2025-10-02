@@ -95,6 +95,22 @@ impl Hash for CacheKey {
 }
 
 impl CacheKey {
+    fn memory_size(&self) -> usize {
+        match self {
+            CacheKey::String(s) => std::mem::size_of::<String>() + s.len(),
+            CacheKey::IntSmall(_) => std::mem::size_of::<i64>(),
+            CacheKey::IntBig(bi) => std::mem::size_of::<BigInt>() + (bi.bits() / 8) as usize,
+            CacheKey::None => std::mem::size_of::<()>(),
+            CacheKey::Tuple(parts) => {
+                std::mem::size_of::<Box<[CacheKey]>>() + 
+                parts.iter().map(|k| k.memory_size()).sum::<usize>()
+            },
+            CacheKey::Hashed { type_name, .. } => {
+                std::mem::size_of::<String>() + type_name.len() + std::mem::size_of::<u64>()
+            },
+        }
+    }
+    
     /// Converts a Python object to a CacheKey for efficient hashing and comparison.
     /// Supports None, tuples, booleans, integers, strings, and arbitrary hashable objects.
     /// Time complexity: O(1) for primitives, O(k) for tuples where k is tuple length.
@@ -175,9 +191,80 @@ struct LruNode {
 #[derive(Debug)]
 pub(crate) struct CacheEntry {
     value: Py<PyAny>,
-    callbacks: Vec<Py<PyAny>>,
+    callbacks: Option<Vec<Py<PyAny>>>,  // None = no callbacks (memory optimization)
     original_key: Py<PyAny>,
     prefix_arcs: Option<Vec<Arc<CacheKey>>>,
+}
+
+impl CacheEntry {
+    /// Estimate memory usage of this cache entry
+    fn memory_size(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>();
+        
+        // Py<PyAny> is just a pointer, but estimate Python object overhead
+        size += 64; // value object estimate
+        size += 64; // original_key object estimate
+        
+        // Callbacks vector
+        if let Some(ref callbacks) = self.callbacks {
+            size += callbacks.capacity() * std::mem::size_of::<Py<PyAny>>();
+            size += callbacks.len() * 64; // callback object estimates
+        }
+        
+        // Prefix arcs vector
+        if let Some(ref prefix_arcs) = self.prefix_arcs {
+            size += prefix_arcs.capacity() * std::mem::size_of::<Arc<CacheKey>>();
+            size += prefix_arcs.iter().map(|arc| arc.memory_size()).sum::<usize>();
+        }
+        
+        size
+    }
+    
+    /// Add callbacks with deduplication like original LruCache
+    fn add_callbacks(&mut self, py: Python, new_callbacks: Vec<Py<PyAny>>) -> PyResult<()> {
+        if new_callbacks.is_empty() {
+            return Ok(());
+        }
+        
+        if self.callbacks.is_none() {
+            self.callbacks = Some(Vec::new());
+        }
+        
+        let callbacks = self.callbacks.as_mut().unwrap();
+        for new_cb in new_callbacks {
+            // Check for duplicates using Python equality
+            let mut is_duplicate = false;
+            for existing_cb in callbacks.iter() {
+                if existing_cb.bind(py).eq(&new_cb.bind(py)).unwrap_or(false) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if !is_duplicate {
+                callbacks.push(new_cb);
+            }
+        }
+        Ok(())
+    }
+    
+    /// Run and clear all callbacks
+    fn run_and_clear_callbacks(&mut self, py: Python) {
+        if let Some(callbacks) = self.callbacks.take() {
+            for callback in callbacks {
+                if let Err(e) = callback.bind(py).call0() {
+                    eprintln!("Cache callback error: {}", e);
+                }
+            }
+        }
+    }
+    
+    /// Get callbacks for execution without clearing
+    fn get_callbacks(&self) -> Vec<Py<PyAny>> {
+        match &self.callbacks {
+            Some(cb) => Python::with_gil(|py| cb.iter().map(|c| c.clone_ref(py)).collect()),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -508,7 +595,8 @@ impl UnifiedCache {
             
             self.remove_from_lru(&cache_key);
             self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
-            Ok((entry.value, entry.callbacks))
+            let callbacks = entry.get_callbacks();
+            Ok((entry.value, callbacks))
         } else {
             Ok((default.unwrap_or_else(|| py.None()), Vec::new()))
         }
@@ -531,8 +619,11 @@ impl UnifiedCache {
         }
         
         self.remove_hierarchy_fast(&lru_key, entry.prefix_arcs.as_ref());
-        rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.callbacks.len());
-        Some((entry.original_key, entry.value, entry.callbacks))
+        rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.get_callbacks().len());
+        let callbacks = entry.get_callbacks();
+        let original_key = entry.original_key;
+        let value = entry.value;
+        Some((original_key, value, callbacks))
     }
     
     /// Inserts or updates a cache entry with the specified key and value.
@@ -566,13 +657,7 @@ impl UnifiedCache {
                 // Check if value changed and run callbacks if so (Python LruCache behavior)
                 let value_changed = !entry.value.bind(py).eq(&value.bind(py)).unwrap_or(false);
                 if value_changed {
-                    // Execute existing callbacks before updating
-                    for callback in &entry.callbacks {
-                        if let Err(e) = callback.bind(py).call0() {
-                            rust_debug_fast!("Callback execution error: {}", e);
-                        }
-                    }
-                    entry.callbacks.clear(); // Clear callbacks after execution
+                    entry.run_and_clear_callbacks(py);
                 }
                 
                 // Update size tracking for existing entry
@@ -581,14 +666,18 @@ impl UnifiedCache {
                 }
                 
                 entry.value = value;
-                // Only update callbacks if new callbacks are provided
-                if !callbacks.is_empty() {
-                    match self.callback_policy {
-                        CallbackPolicy::Replace => entry.callbacks = callbacks,
-                        CallbackPolicy::Append => entry.callbacks.extend(callbacks),
-                    }
+                // Handle callback updates based on policy
+                match self.callback_policy {
+                    CallbackPolicy::Replace => {
+                        if !callbacks.is_empty() {
+                            entry.callbacks = Some(callbacks);
+                        }
+                        // If empty, preserve existing callbacks (Python LruCache behavior)
+                    },
+                    CallbackPolicy::Append => {
+                        entry.add_callbacks(py, callbacks)?;
+                    },
                 }
-                // If callbacks is empty, preserve existing callbacks (Python LruCache behavior)
             }
             
             if !self.move_to_front(&cache_key) {
@@ -624,7 +713,7 @@ impl UnifiedCache {
             
             let entry = CacheEntry {
                 value,
-                callbacks,
+                callbacks: if callbacks.is_empty() { None } else { Some(callbacks) },
                 original_key,
                 prefix_arcs: if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) },
             };
@@ -666,15 +755,16 @@ impl UnifiedCache {
             
             // Add callbacks if provided (Python LruCache behavior)
             if let Some(new_callbacks) = callbacks {
-                // Always process callbacks, even if empty (matches Python behavior)
                 match self.callback_policy {
                     CallbackPolicy::Replace => {
                         if !new_callbacks.is_empty() {
-                            entry.callbacks = new_callbacks;
+                            entry.callbacks = Some(new_callbacks);
                         }
                         // If empty, preserve existing callbacks (Python add_callbacks behavior)
                     },
-                    CallbackPolicy::Append => entry.callbacks.extend(new_callbacks),
+                    CallbackPolicy::Append => {
+                        entry.add_callbacks(py, new_callbacks)?;
+                    },
                 }
             }
             
@@ -715,7 +805,7 @@ impl UnifiedCache {
             
             self.remove_from_lru(&cache_key);
             self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
-            Ok((true, entry.callbacks))
+            Ok((true, entry.get_callbacks()))
         } else {
             rust_debug_fast!("Entry not found");
             Ok((false, Vec::new()))
@@ -731,7 +821,7 @@ impl UnifiedCache {
         
         let mut all_callbacks = Vec::new();
         for entry in self.data.values() {
-            all_callbacks.extend(entry.callbacks.iter().map(|cb| cb.clone_ref(py)));
+            all_callbacks.extend(entry.get_callbacks().iter().map(|cb| cb.clone_ref(py)));
         }
         
         self.data.clear();
@@ -1027,7 +1117,7 @@ impl RustLruCache {
             let entry_count = removed_entries.len();
             
             for (_, entry) in removed_entries {
-                all_callbacks.extend(entry.callbacks);
+                all_callbacks.extend(entry.get_callbacks());
             }
             
             entry_count
@@ -1217,6 +1307,51 @@ impl RustLruCache {
     /// TreeCache multi-delete - removes all entries with prefix
     fn del_multi(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<usize> {
         self.invalidate_prefix(py, prefix_key)
+    }
+    
+    /// Get cache statistics for debugging
+    fn get_stats(&self) -> PyResult<(usize, usize)> {
+        let cache = self.cache.read();
+        Ok((cache.data.len(), cache.capacity))
+    }
+    
+    /// Check if cache is empty
+    fn is_empty(&self) -> PyResult<bool> {
+        Ok(self.cache.read().data.is_empty())
+    }
+    
+    /// Get estimated memory usage in bytes (matches original LruCache behavior)
+    fn get_memory_usage(&self) -> PyResult<usize> {
+        let cache = self.cache.read();
+        let mut total = 0;
+        
+        // Cache structure overhead
+        total += cache.data.capacity() * std::mem::size_of::<(Arc<CacheKey>, CacheEntry)>();
+        total += cache.lru_nodes.capacity() * std::mem::size_of::<(Arc<CacheKey>, Box<LruNode>)>();
+        
+        // Per-entry memory usage
+        for (key, entry) in &cache.data {
+            total += key.memory_size();
+            total += entry.memory_size();
+        }
+        
+        // LRU node overhead
+        total += cache.lru_nodes.len() * std::mem::size_of::<LruNode>();
+        
+        Ok(total)
+    }
+    
+    /// Enhanced get with update_metrics and update_last_access parameters
+    fn get_advanced(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>, callbacks: Option<Vec<Py<PyAny>>>, _update_metrics: Option<bool>, _update_last_access: Option<bool>) -> PyResult<Py<PyAny>> {
+        let mut cache = self.cache.write();
+        let cb_list = callbacks.unwrap_or_default();
+        
+        // For now, ignore update_metrics and update_last_access parameters
+        // They would require more sophisticated integration with metrics system
+        match cache.get(py, key, Some(cb_list))? {
+            Some(value) => Ok(value),
+            None => Ok(default.unwrap_or_else(|| py.None()))
+        }
     }
 }
 
