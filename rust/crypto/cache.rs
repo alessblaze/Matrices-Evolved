@@ -27,6 +27,29 @@ use std::sync::{Arc, LazyLock};
 use num_bigint::BigInt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// Global timer for relative time tracking
+static CACHE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+});
+
+// Get relative time in milliseconds since cache system started
+fn get_relative_time_ms() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    now.saturating_sub(*CACHE_START_TIME)
+}
+
+// Convert Python clock time (seconds) to our relative time (milliseconds)
+fn python_time_to_relative_ms(python_seconds: f64) -> u64 {
+    (python_seconds * 1000.0) as u64
+}
 
 // Cached debug flag for optimal performance
 static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("SYNAPSE_RUST_CACHE_DEBUG").is_ok());
@@ -1167,12 +1190,23 @@ impl RustCacheNode {
         Ok(found)
     }
     
-    fn update_last_access(&self, _clock: Option<Py<PyAny>>) {
-        // Update access time atomically
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+    fn update_last_access(&self, clock: Option<Py<PyAny>>) {
+        // Use Python clock time if provided, otherwise use relative time
+        let now = if let Some(clock_obj) = clock {
+            Python::with_gil(|py| {
+                if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
+                    if let Ok(time_result) = time_method.call0() {
+                        if let Ok(time_seconds) = time_result.extract::<f64>() {
+                            return python_time_to_relative_ms(time_seconds);
+                        }
+                    }
+                }
+                get_relative_time_ms()
+            })
+        } else {
+            get_relative_time_ms()
+        };
+        
         self.last_access_time.store(now, Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
         
@@ -1181,14 +1215,24 @@ impl RustCacheNode {
         cache.touch_key(&self.key);
     }
     
-    /// Get last access time in milliseconds since epoch
+    /// Get last access time in relative milliseconds
     fn get_last_access_time(&self) -> u64 {
         self.last_access_time.load(Ordering::Relaxed)
     }
     
-    /// Get creation time in milliseconds since epoch
+    /// Get creation time in relative milliseconds
     fn get_creation_time(&self) -> u64 {
         self.creation_time
+    }
+    
+    /// Get last access time in Python clock seconds (for compatibility)
+    fn get_last_access_time_seconds(&self) -> f64 {
+        self.last_access_time.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    
+    /// Get creation time in Python clock seconds (for compatibility)
+    fn get_creation_time_seconds(&self) -> f64 {
+        self.creation_time as f64 / 1000.0
     }
     
     /// Get access count
@@ -1198,6 +1242,12 @@ impl RustCacheNode {
     
     /// Check if node is older than given time (for time-based eviction)
     fn is_older_than(&self, time_ms: u64) -> bool {
+        self.last_access_time.load(Ordering::Relaxed) < time_ms
+    }
+    
+    /// Check if node is older than given Python clock time in seconds
+    fn is_older_than_seconds(&self, time_seconds: f64) -> bool {
+        let time_ms = python_time_to_relative_ms(time_seconds);
         self.last_access_time.load(Ordering::Relaxed) < time_ms
     }
     
@@ -1636,14 +1686,29 @@ impl RustLruCache {
     }
     
     /// Creates a cache node for global eviction tracking
-    #[pyo3(signature = (key, callbacks=None))]
-    fn create_node(&self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Py<RustCacheNode>> {
+    #[pyo3(signature = (key, callbacks=None, clock=None))]
+    fn create_node(&self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>, clock: Option<Py<PyAny>>) -> PyResult<Py<RustCacheNode>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        
+        // Use Python clock time if provided, otherwise use relative time
+        let now = if let Some(clock_obj) = clock {
+            if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
+                if let Ok(time_result) = time_method.call0() {
+                    if let Ok(time_seconds) = time_result.extract::<f64>() {
+                        python_time_to_relative_ms(time_seconds)
+                    } else {
+                        get_relative_time_ms()
+                    }
+                } else {
+                    get_relative_time_ms()
+                }
+            } else {
+                get_relative_time_ms()
+            }
+        } else {
+            get_relative_time_ms()
+        };
         
         let node = RustCacheNode {
             cache: Arc::clone(&self.cache),
