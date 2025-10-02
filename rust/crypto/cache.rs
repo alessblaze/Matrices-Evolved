@@ -19,13 +19,14 @@ You should have received a copy of the License along with this program; if not, 
 */
 
 use pyo3::prelude::*;
-use pyo3::types::{PyTuple, PyString, PyInt, PyBool};
+use pyo3::types::{PyTuple, PyString, PyInt, PyBool, PyAny};
 use parking_lot::RwLock;
 use tokio::sync::RwLock as AsyncRwLock;
 use hashbrown::HashMap;
 use std::sync::{Arc, LazyLock};
 use num_bigint::BigInt;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Cached debug flag for optimal performance
 static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("SYNAPSE_RUST_CACHE_DEBUG").is_ok());
@@ -194,9 +195,39 @@ pub(crate) struct CacheEntry {
     callbacks: Option<Vec<Py<PyAny>>>,  // None = no callbacks (memory optimization)
     original_key: Py<PyAny>,
     prefix_arcs: Option<Vec<Arc<CacheKey>>>,
+    node_id: Option<u64>,  // Link to RustCacheNode
 }
 
+/// Rust-based cache node for global eviction tracking
+#[pyclass]
+pub struct RustCacheNode {
+    cache: Arc<RwLock<UnifiedCache>>,
+    key: Arc<CacheKey>,
+    node_id: u64,
+    callbacks: Option<Vec<Py<PyAny>>>,
+    // Time-based eviction fields
+    last_access_time: AtomicU64,
+    creation_time: u64,
+    access_count: AtomicU64,
+    // Global eviction list management
+    prev_node: Option<u64>,
+    next_node: Option<u64>,
+    in_global_list: bool,
+}
+
+static NODE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 impl CacheEntry {
+    fn new(value: Py<PyAny>, original_key: Py<PyAny>) -> Self {
+        Self {
+            value,
+            callbacks: None,
+            original_key,
+            prefix_arcs: None,
+            node_id: None,
+        }
+    }
+    
     /// Estimate memory usage of this cache entry
     fn memory_size(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
@@ -711,12 +742,9 @@ impl UnifiedCache {
                 self.current_size = self.current_size.saturating_add(new_entry_size);
             }
             
-            let entry = CacheEntry {
-                value,
-                callbacks: if callbacks.is_empty() { None } else { Some(callbacks) },
-                original_key,
-                prefix_arcs: if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) },
-            };
+            let mut entry = CacheEntry::new(value, original_key);
+            entry.callbacks = if callbacks.is_empty() { None } else { Some(callbacks) };
+            entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
             
             self.data.insert(cache_key.clone(), entry);
             self.add_to_front(cache_key);
@@ -790,25 +818,41 @@ impl UnifiedCache {
     /// Removes a cache entry and performs full cleanup.
     /// Returns (found, callbacks) tuple indicating success and any callbacks to execute.
     /// Time complexity: O(k) where k is tuple length for hierarchy cleanup.
-    pub fn invalidate(&mut self, _py: Python, key: &Bound<'_, PyAny>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
+    pub fn invalidate(&mut self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
         rust_debug_fast!("UnifiedCache::invalidate() called");
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
-        
-        if let Some(entry) = self.data.remove(&cache_key) {
+        self.invalidate_by_key(py, &cache_key)
+    }
+    
+    /// Invalidates a cache entry by its CacheKey directly
+    pub fn invalidate_by_key(&mut self, py: Python, key: &Arc<CacheKey>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
+        if let Some(entry) = self.data.remove(key) {
             rust_debug_fast!("Entry found, removing from cache and LRU");
             
             // Update size tracking for removed entry
             if self.size_callback.is_some() {
-                let entry_size = self.calculate_size(_py, &entry.value).unwrap_or(1);
+                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
                 self.current_size = self.current_size.saturating_sub(entry_size);
             }
             
-            self.remove_from_lru(&cache_key);
-            self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
+            self.remove_from_lru(key);
+            self.remove_hierarchy_fast(key, entry.prefix_arcs.as_ref());
             Ok((true, entry.get_callbacks()))
         } else {
             rust_debug_fast!("Entry not found");
             Ok((false, Vec::new()))
+        }
+    }
+    
+    /// Gets a cache entry by its CacheKey directly
+    pub fn get_by_key(&self, key: &Arc<CacheKey>) -> Option<&CacheEntry> {
+        self.data.get(key)
+    }
+    
+    /// Updates LRU position for a key without returning the value
+    pub fn touch_key(&mut self, key: &Arc<CacheKey>) {
+        if self.data.contains_key(key) {
+            self.move_to_front(key);
         }
     }
     
@@ -1021,6 +1065,243 @@ pub struct RustLruCache {
 pub struct AsyncRustLruCache {
     cache: Arc<AsyncRwLock<UnifiedCache>>,
     name: String,
+}
+
+#[pymethods]
+impl RustCacheNode {
+    #[getter]
+    fn key(&self, py: Python) -> PyResult<Py<PyAny>> {
+        match self.key.as_ref() {
+            CacheKey::String(s) => Ok(PyString::new(py, s).into()),
+            CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
+            CacheKey::IntBig(bi) => {
+                let s = bi.to_string();
+                Ok(PyString::new(py, &s).into())
+            },
+            CacheKey::None => Ok(py.None()),
+            CacheKey::Tuple(parts) => {
+                let py_parts: PyResult<Vec<_>> = parts.iter()
+                    .map(|part| {
+                        match part {
+                            CacheKey::String(s) => Ok(PyString::new(py, s).into()),
+                            CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
+                            CacheKey::None => Ok(py.None()),
+                            _ => Ok(PyString::new(py, &format!("{:?}", part)).into())
+                        }
+                    })
+                    .collect();
+                let tuple = PyTuple::new(py, py_parts?)?;
+                Ok(tuple.into())
+            },
+            CacheKey::Hashed { type_name, hash } => {
+                Ok(PyString::new(py, &format!("{}#{}", type_name, hash)).into())
+            }
+        }
+    }
+    
+    #[getter]
+    fn value(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let cache = self.cache.read();
+        match cache.get_by_key(&self.key) {
+            Some(entry) => Ok(Some(entry.value.clone_ref(py))),
+            None => Ok(None)
+        }
+    }
+    
+    fn get_cache_entry(&self) -> PyResult<()> {
+        Ok(())
+    }
+    
+    fn add_callbacks(&mut self, py: Python, callbacks: Vec<Py<PyAny>>) -> PyResult<()> {
+        if callbacks.is_empty() {
+            return Ok(());
+        }
+        
+        match &mut self.callbacks {
+            Some(existing) => {
+                // Deduplicate using Python equality
+                for new_cb in callbacks {
+                    let mut is_duplicate = false;
+                    for existing_cb in existing.iter() {
+                        if existing_cb.bind(py).eq(&new_cb.bind(py)).unwrap_or(false) {
+                            is_duplicate = true;
+                            break;
+                        }
+                    }
+                    if !is_duplicate {
+                        existing.push(new_cb);
+                    }
+                }
+            }
+            None => {
+                self.callbacks = Some(callbacks);
+            }
+        }
+        Ok(())
+    }
+    
+    fn run_and_clear_callbacks(&mut self, py: Python) {
+        if let Some(callbacks) = self.callbacks.take() {
+            for callback in callbacks {
+                if let Err(e) = callback.bind(py).call0() {
+                    eprintln!("Cache callback error: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn drop_from_cache(&mut self, py: Python) -> PyResult<bool> {
+        let (found, callbacks) = {
+            let mut cache = self.cache.write();
+            cache.invalidate_by_key(py, &self.key)?
+        };
+        
+        for callback in callbacks {
+            if let Err(e) = callback.bind(py).call0() {
+                eprintln!("Cache callback error: {}", e);
+            }
+        }
+        
+        self.run_and_clear_callbacks(py);
+        
+        Ok(found)
+    }
+    
+    fn update_last_access(&self, _clock: Option<Py<PyAny>>) {
+        // Update access time atomically
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_access_time.store(now, Ordering::Relaxed);
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+        
+        // Update LRU position in cache
+        let mut cache = self.cache.write();
+        cache.touch_key(&self.key);
+    }
+    
+    /// Get last access time in milliseconds since epoch
+    fn get_last_access_time(&self) -> u64 {
+        self.last_access_time.load(Ordering::Relaxed)
+    }
+    
+    /// Get creation time in milliseconds since epoch
+    fn get_creation_time(&self) -> u64 {
+        self.creation_time
+    }
+    
+    /// Get access count
+    fn get_access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
+    }
+    
+    /// Check if node is older than given time (for time-based eviction)
+    fn is_older_than(&self, time_ms: u64) -> bool {
+        self.last_access_time.load(Ordering::Relaxed) < time_ms
+    }
+    
+    /// Get memory usage of this node
+    fn get_memory_usage(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>();
+        size += self.key.memory_size();
+        if let Some(ref callbacks) = self.callbacks {
+            size += callbacks.len() * std::mem::size_of::<Py<PyAny>>();
+        }
+        size
+    }
+    
+    /// Calculate value size using cache's size callback
+    fn calculate_value_size(&self, py: Python) -> PyResult<usize> {
+        let cache = self.cache.read();
+        if let Some(entry) = cache.get_by_key(&self.key) {
+            cache.calculate_size(py, &entry.value)
+        } else {
+            Ok(1) // Default size if entry not found
+        }
+    }
+    
+    /// Get total memory footprint (node + value)
+    fn get_total_memory_usage(&self, py: Python) -> PyResult<usize> {
+        let node_size = self.get_memory_usage();
+        let value_size = self.calculate_value_size(py)?;
+        Ok(node_size + value_size)
+    }
+    
+    /// Check if this node's key still exists in cache
+    fn is_valid(&self) -> bool {
+        let cache = self.cache.read();
+        cache.contains(&self.key)
+    }
+    
+    /// Get node ID for tracking
+    fn get_node_id(&self) -> u64 {
+        self.node_id
+    }
+    
+    /// Get callbacks without clearing (for inspection)
+    fn get_callbacks(&self) -> Vec<Py<PyAny>> {
+        match &self.callbacks {
+            Some(cb) => Python::with_gil(|py| cb.iter().map(|c| c.clone_ref(py)).collect()),
+            None => Vec::new()
+        }
+    }
+    
+    /// Add to global eviction list (for time-based eviction)
+    fn add_to_global_list(&mut self, prev_id: Option<u64>, next_id: Option<u64>) {
+        self.prev_node = prev_id;
+        self.next_node = next_id;
+        self.in_global_list = true;
+    }
+    
+    /// Remove from global eviction list
+    fn remove_from_global_list(&mut self) -> (Option<u64>, Option<u64>) {
+        let prev = self.prev_node;
+        let next = self.next_node;
+        self.prev_node = None;
+        self.next_node = None;
+        self.in_global_list = false;
+        (prev, next)
+    }
+    
+    /// Move to front of global eviction list
+    fn move_to_front_global(&mut self, new_next: Option<u64>) {
+        self.prev_node = None;
+        self.next_node = new_next;
+    }
+    
+    /// Check if node is in global eviction list
+    fn is_in_global_list(&self) -> bool {
+        self.in_global_list
+    }
+    
+    /// Compare current value with new value (for change detection)
+    fn value_changed(&self, py: Python, new_value: Py<PyAny>) -> PyResult<bool> {
+        let cache = self.cache.read();
+        if let Some(entry) = cache.get_by_key(&self.key) {
+            Ok(!entry.value.bind(py).eq(&new_value.bind(py)).unwrap_or(false))
+        } else {
+            Ok(true) // No current value, so it's a change
+        }
+    }
+    
+    /// Set value and run callbacks if changed
+    fn set_value_if_changed(&mut self, py: Python, new_value: Py<PyAny>) -> PyResult<bool> {
+        let changed = self.value_changed(py, new_value.clone_ref(py))?;
+        if changed {
+            // Update cache value
+            {
+                let mut cache = self.cache.write();
+                if let Some(entry) = cache.data.get_mut(&self.key) {
+                    entry.value = new_value;
+                    entry.run_and_clear_callbacks(py);
+                }
+            }
+            // Run node callbacks
+            self.run_and_clear_callbacks(py);
+        }
+        Ok(changed)
+    }
 }
 
 #[pymethods]
@@ -1352,6 +1633,32 @@ impl RustLruCache {
             Some(value) => Ok(value),
             None => Ok(default.unwrap_or_else(|| py.None()))
         }
+    }
+    
+    /// Creates a cache node for global eviction tracking
+    #[pyo3(signature = (key, callbacks=None))]
+    fn create_node(&self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Py<RustCacheNode>> {
+        let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        
+        let node = RustCacheNode {
+            cache: Arc::clone(&self.cache),
+            key: cache_key,
+            node_id,
+            callbacks,
+            last_access_time: AtomicU64::new(now),
+            creation_time: now,
+            access_count: AtomicU64::new(0),
+            prev_node: None,
+            next_node: None,
+            in_global_list: false,
+        };
+        
+        Ok(Py::new(py, node)?)
     }
 }
 

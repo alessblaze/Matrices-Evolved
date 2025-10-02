@@ -65,6 +65,7 @@ pub use event_signing::{
 pub use cache::{
     RustLruCache,
     AsyncRustLruCache,
+    RustCacheNode,
     create_rust_lru_cache,
     create_async_rust_lru_cache,
 };
@@ -119,6 +120,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     // Rust LRU Cache
     m.add_class::<RustLruCache>()?;
     m.add_class::<AsyncRustLruCache>()?;
+    m.add_class::<RustCacheNode>()?;
     m.add_function(wrap_pyfunction!(create_rust_lru_cache, m)?)?;
     m.add_function(wrap_pyfunction!(create_async_rust_lru_cache, m)?)?;
     
