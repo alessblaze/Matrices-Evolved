@@ -377,6 +377,15 @@ pub struct UnifiedCache {
     current_size: usize,
     // Node tracking for global eviction
     enable_nodes: bool,
+    // Internal stats tracking
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions_size: AtomicU64,
+    evictions_invalidation: AtomicU64,
+    memory_usage: AtomicU64,
+    sets: AtomicU64,
+    setdefault_hits: AtomicU64,
+    prefix_invalidations: AtomicU64,
 }
 
 impl UnifiedCache {
@@ -399,6 +408,14 @@ impl UnifiedCache {
             size_callback: None,
             current_size: 0,
             enable_nodes: false,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions_size: AtomicU64::new(0),
+            evictions_invalidation: AtomicU64::new(0),
+            memory_usage: AtomicU64::new(0),
+            sets: AtomicU64::new(0),
+            setdefault_hits: AtomicU64::new(0),
+            prefix_invalidations: AtomicU64::new(0),
         }
     }
     
@@ -668,6 +685,7 @@ impl UnifiedCache {
     /// Time complexity: O(children) where children is the number of matching entries.
     fn invalidate_prefix(&mut self, py: Python, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
         let mut removed_entries = Vec::new();
+        let mut removed_count = 0;
         
         if let Some(children) = self.hierarchy.get(prefix_key) {
             let child_keys: Vec<_> = children.keys().cloned().collect();
@@ -677,12 +695,14 @@ impl UnifiedCache {
                     if self.size_callback.is_some() {
                         let entry_size = self.calculate_size(py, &entry.value).unwrap_or(DEFAULT_ENTRY_SIZE);
                         self.current_size = self.current_size.saturating_sub(entry_size);
+                        self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
                     }
                     
                     self.remove_from_lru(&child_key);
                     // Clean up hierarchy state for each removed child
                     self.remove_hierarchy_fast(&child_key, entry.prefix_arcs.as_ref());
                     removed_entries.push((child_key, entry));
+                    removed_count += 1;
                 } else {
                     // Fallback: reconstruct arcs from the child key to release prefix refs
                     if let CacheKey::Tuple(parts) = child_key.as_ref() {
@@ -708,6 +728,9 @@ impl UnifiedCache {
             self.hierarchy.remove(prefix_key);
         }
         
+        // Update prefix invalidation stats
+        self.prefix_invalidations.fetch_add(removed_count, Ordering::Relaxed);
+        
         removed_entries
     }
     
@@ -723,6 +746,7 @@ impl UnifiedCache {
             if self.size_callback.is_some() {
                 let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
                 self.current_size = self.current_size.saturating_sub(entry_size);
+                self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
             }
             
             self.remove_from_lru(&cache_key);
@@ -748,7 +772,11 @@ impl UnifiedCache {
         if self.size_callback.is_some() {
             let entry_size = self.calculate_size(_py, &entry.value).unwrap_or(DEFAULT_ENTRY_SIZE);
             self.current_size = self.current_size.saturating_sub(entry_size);
+            self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
         }
+        
+        // Track eviction stats
+        self.evictions_size.fetch_add(1, Ordering::Relaxed);
         
         self.remove_hierarchy_fast(&lru_key, entry.prefix_arcs.as_ref());
         rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.get_callbacks().len());
@@ -767,6 +795,9 @@ impl UnifiedCache {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         let original_key = key.clone().unbind();
         let mut evicted_callbacks = Vec::new();
+        
+        // Track set operations
+        self.sets.fetch_add(1, Ordering::Relaxed);
         
         if self.data.contains_key(&cache_key) {
             rust_debug_fast!("Key exists, updating entry");
@@ -795,6 +826,12 @@ impl UnifiedCache {
                 // Update size tracking for existing entry
                 if self.size_callback.is_some() {
                     self.current_size = self.current_size.saturating_sub(old_size).saturating_add(new_size);
+                    let signed = new_size as i64 - old_size as i64;
+                    if signed >= 0 {
+                        self.memory_usage.fetch_add(signed as u64, Ordering::Relaxed);
+                    } else {
+                        self.memory_usage.fetch_sub((-signed) as u64, Ordering::Relaxed);
+                    }
                 }
                 
                 entry.value = value;
@@ -841,6 +878,7 @@ impl UnifiedCache {
             // Update size tracking for new entry (size already calculated above)
             if self.size_callback.is_some() {
                 self.current_size = self.current_size.saturating_add(new_entry_size);
+                self.memory_usage.fetch_add(new_entry_size as u64, Ordering::Relaxed);
             }
             
             // Auto-create node for global eviction if enabled
@@ -856,10 +894,10 @@ impl UnifiedCache {
         Ok(evicted_callbacks)
     }
     
-    /// Retrieves a cache entry and updates its LRU position.
-    /// Records cache hit/miss metrics if metrics are configured.
+    /// Retrieves a cache entry and optionally updates its LRU position and metrics.
+    /// Records cache hit/miss metrics if metrics are configured and update_metrics is true.
     /// Time complexity: O(1) for HashMap lookup and LRU update.
-    pub fn get(&mut self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Option<Py<PyAny>>> {
+    pub fn get(&mut self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>, update_metrics: bool, update_last_access: bool) -> PyResult<Option<Py<PyAny>>> {
         rust_debug_fast!("UnifiedCache::get() called");
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         
@@ -872,8 +910,11 @@ impl UnifiedCache {
             self.check_consistency();
             // Re-check after consistency repair
             if !self.data.contains_key(&cache_key) {
-                if let Some(ref metrics) = self.metrics {
-                    let _ = metrics.bind(py).call_method1("record_cache_miss", (&self.name,));
+                if update_metrics {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref metrics) = self.metrics {
+                        let _ = metrics.bind(py).call_method0("inc_misses");
+                    }
                 }
                 return Ok(None);
             }
@@ -898,22 +939,30 @@ impl UnifiedCache {
                 }
             }
             
-
-            
-            if !self.move_to_front(&cache_key) {
-                // If move_to_front fails, try adding to front as fallback
-                self.add_to_front(cache_key);
+            // Update LRU position only if requested
+            if update_last_access {
+                if !self.move_to_front(&cache_key) {
+                    // If move_to_front fails, try adding to front as fallback
+                    self.add_to_front(cache_key);
+                }
             }
             
-            if let Some(ref metrics) = self.metrics {
-                let _ = metrics.bind(py).call_method1("record_cache_hit", (&self.name,));
+            // Record metrics only if requested
+            if update_metrics {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref metrics) = self.metrics {
+                    let _ = metrics.bind(py).call_method0("inc_hits");
+                }
             }
             
             Ok(Some(value))
         } else {
             rust_debug_fast!("Cache miss");
-            if let Some(ref metrics) = self.metrics {
-                let _ = metrics.bind(py).call_method1("record_cache_miss", (&self.name,));
+            if update_metrics {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref metrics) = self.metrics {
+                    let _ = metrics.bind(py).call_method0("inc_misses");
+                }
             }
             Ok(None)
         }
@@ -937,9 +986,11 @@ impl UnifiedCache {
             if self.size_callback.is_some() {
                 let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
                 self.current_size = self.current_size.saturating_sub(entry_size);
+                self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
             }
             
-
+            // Track invalidation stats
+            self.evictions_invalidation.fetch_add(1, Ordering::Relaxed);
             
             self.remove_from_lru(key);
             self.remove_hierarchy_fast(key, entry.prefix_arcs.as_ref());
@@ -982,6 +1033,7 @@ impl UnifiedCache {
         self.head = None;
         self.tail = None;
         self.current_size = 0;
+        self.memory_usage.store(0, Ordering::Relaxed);
         
         rust_debug_fast!("UnifiedCache::clear() completed for cache '{}', cleared {} entries, {} callbacks", self.name, count, all_callbacks.len());
         (count, all_callbacks)
@@ -1105,26 +1157,92 @@ impl UnifiedCache {
     pub fn setdefault(&mut self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         
-        // Check if key exists first
-        if let Some(entry) = self.data.get(&cache_key) {
-            let existing_value = entry.value.clone_ref(py);
-            // Move to front after getting value
-            if !self.move_to_front(&cache_key) {
-                self.add_to_front(cache_key);
-            }
-            Ok(existing_value)
-        } else {
-            // Key doesn't exist, set it and return the value
-            let value_clone = value.clone_ref(py);
-            let evicted_callbacks = self.set(py, key, value_clone, Vec::new())?;
-            // Execute callbacks outside the method to avoid borrow issues
-            for callback in evicted_callbacks {
-                if let Err(e) = callback.bind(py).call0() {
-                    eprintln!("Cache callback error: {}", e);
+        // Atomic check-and-insert using HashMap entry API
+        match self.data.get(&cache_key) {
+            Some(entry) => {
+                self.setdefault_hits.fetch_add(1, Ordering::Relaxed);
+                let existing_value = entry.value.clone_ref(py);
+                // Move to front after getting value
+                if !self.move_to_front(&cache_key) {
+                    self.add_to_front(cache_key);
                 }
+                Ok(existing_value)
             }
-            Ok(value)
+            None => {
+                // Insert directly without calling set() to avoid race
+                let original_key = key.clone().unbind();
+                let mut evicted_callbacks = Vec::new();
+                
+                // Track set operations
+                self.sets.fetch_add(1, Ordering::Relaxed);
+                
+                // Calculate entry size for eviction logic
+                let new_entry_size = if self.size_callback.is_some() {
+                    self.calculate_size(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE)
+                } else {
+                    DEFAULT_ENTRY_SIZE
+                };
+                
+                // Evict LRU entries until we have space
+                while (if self.size_callback.is_some() { self.current_size + new_entry_size } else { self.data.len() + 1 }) > self.capacity {
+                    if let Some((_, _, callbacks)) = self.popitem(py) {
+                        evicted_callbacks.extend(callbacks);
+                    } else {
+                        break;
+                    }
+                }
+                
+                let prefix_arcs = self.add_hierarchy(&cache_key);
+                
+                // Update size tracking
+                if self.size_callback.is_some() {
+                    self.current_size = self.current_size.saturating_add(new_entry_size);
+                    self.memory_usage.fetch_add(new_entry_size as u64, Ordering::Relaxed);
+                }
+                
+                // Create and insert entry
+                let mut entry = CacheEntry::new(value.clone_ref(py), original_key);
+                entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
+                
+                self.data.insert(cache_key.clone(), entry);
+                self.add_to_front(cache_key);
+                
+                // Execute callbacks
+                for callback in evicted_callbacks {
+                    if let Err(e) = callback.bind(py).call0() {
+                        eprintln!("Cache callback error: {}", e);
+                    }
+                }
+                
+                Ok(value)
+            }
         }
+    }
+    
+    /// Get cache statistics
+    pub fn get_stats(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+            self.evictions_size.load(Ordering::Relaxed),
+            self.evictions_invalidation.load(Ordering::Relaxed),
+            self.memory_usage.load(Ordering::Relaxed),
+            self.sets.load(Ordering::Relaxed),
+            self.setdefault_hits.load(Ordering::Relaxed),
+            self.prefix_invalidations.load(Ordering::Relaxed),
+        )
+    }
+    
+    /// Reset all statistics
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.evictions_size.store(0, Ordering::Relaxed);
+        self.evictions_invalidation.store(0, Ordering::Relaxed);
+        self.memory_usage.store(0, Ordering::Relaxed);
+        self.sets.store(0, Ordering::Relaxed);
+        self.setdefault_hits.store(0, Ordering::Relaxed);
+        self.prefix_invalidations.store(0, Ordering::Relaxed);
     }
     
     /// Gets all entries that have the given tuple prefix.
@@ -1304,19 +1422,22 @@ impl RustCacheNode {
         }
     }
     
-    fn update_last_access(&self, clock: Option<Py<PyAny>>) {
+    fn update_last_access(&self, py: Python, clock: Option<Py<PyAny>>) {
         // Use Python clock time if provided, otherwise use relative time
         let now = if let Some(clock_obj) = clock {
-            Python::with_gil(|py| {
-                if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
-                    if let Ok(time_result) = time_method.call0() {
-                        if let Ok(time_seconds) = time_result.extract::<f64>() {
-                            return python_time_to_relative_ms(time_seconds);
-                        }
+            if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
+                if let Ok(time_result) = time_method.call0() {
+                    if let Ok(time_seconds) = time_result.extract::<f64>() {
+                        python_time_to_relative_ms(time_seconds)
+                    } else {
+                        get_relative_time_ms()
                     }
+                } else {
+                    get_relative_time_ms()
                 }
+            } else {
                 get_relative_time_ms()
-            })
+            }
         } else {
             get_relative_time_ms()
         };
@@ -1551,7 +1672,7 @@ impl RustLruCache {
     #[pyo3(signature = (key, default=None, callbacks=None))]
     fn get(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Py<PyAny>> {
         let mut cache = self.cache.write();
-        match cache.get(py, key, callbacks)? {
+        match cache.get(py, key, callbacks, true, true)? {
             Some(value) => Ok(value),
             None => Ok(default.unwrap_or_else(|| py.None()))
         }
@@ -1589,13 +1710,15 @@ impl RustLruCache {
                 cache.create_eviction_node(&self.cache, py, &cache_key, &[])
             }?;
             
-            // Then update the entry
+            // Then update the entry - re-check existence after concurrent removal
             let mut cache = self.cache.write();
             if let Some(entry) = cache.data.get_mut(&cache_key) {
                 if entry.node.is_none() {
                     entry.node = Some(node);
                 }
+                // If entry.node is already Some, the node was created concurrently - discard our node
             }
+            // If entry doesn't exist, it was removed concurrently - discard our node
         }
         
         for callback in evicted_callbacks {
@@ -1746,7 +1869,7 @@ impl RustLruCache {
     /// Python dict[key] support - returns value or raises KeyError.
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let mut cache = self.cache.write();
-        match cache.get(py, key, None)? {
+        match cache.get(py, key, None, true, true)? {
             Some(value) => Ok(value),
             None => Err(pyo3::exceptions::PyKeyError::new_err("Key not found"))
         }
@@ -1864,9 +1987,9 @@ impl RustLruCache {
         let mut cache = self.cache.write();
         let cb_list = callbacks.unwrap_or_default();
         
-        // For now, ignore update_metrics and update_last_access parameters
-        // They would require more sophisticated integration with metrics system
-        match cache.get(py, key, Some(cb_list))? {
+        let update_metrics = _update_metrics.unwrap_or(true);
+        let update_last_access = _update_last_access.unwrap_or(true);
+        match cache.get(py, key, Some(cb_list), update_metrics, update_last_access)? {
             Some(value) => Ok(value),
             None => Ok(default.unwrap_or_else(|| py.None()))
         }
@@ -1893,6 +2016,43 @@ impl RustLruCache {
         Ok(cache.data.get(&cache_key)
             .and_then(|entry| entry.node.as_ref())
             .map(|node| node.clone_ref(py)))
+    }
+    
+    /// Get cache statistics (hits, misses, evictions_size, evictions_invalidation, memory_usage, sets, setdefault_hits, prefix_invalidations)
+    fn get_cache_stats(&self) -> PyResult<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+        let cache = self.cache.read();
+        Ok(cache.get_stats())
+    }
+    
+    /// Reset all cache statistics
+    fn reset_cache_stats(&self) -> PyResult<()> {
+        let cache = self.cache.read();
+        cache.reset_stats();
+        Ok(())
+    }
+    
+    /// Get hit count
+    fn get_hits(&self) -> PyResult<u64> {
+        let cache = self.cache.read();
+        Ok(cache.hits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    
+    /// Get miss count
+    fn get_misses(&self) -> PyResult<u64> {
+        let cache = self.cache.read();
+        Ok(cache.misses.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    
+    /// Get eviction count by size
+    fn get_evictions_size(&self) -> PyResult<u64> {
+        let cache = self.cache.read();
+        Ok(cache.evictions_size.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    
+    /// Get eviction count by invalidation
+    fn get_evictions_invalidation(&self) -> PyResult<u64> {
+        let cache = self.cache.read();
+        Ok(cache.evictions_invalidation.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -1932,7 +2092,7 @@ impl AsyncRustLruCache {
             let mut cache = cache.write().await;
             Python::with_gil(|py| {
                 let key_bound = key.bind(py);
-                match cache.get(py, &key_bound, None)? {
+                match cache.get(py, &key_bound, None, true, true)? {
                     Some(value) => Ok(value),
                     None => Ok(default.unwrap_or_else(|| py.None()))
                 }
