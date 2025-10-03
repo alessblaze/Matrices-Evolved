@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "matrices_evolved"
-version = "1.0.4"
+version = "1.0.5"
 description = "High-performance Matrix event signing library"
 authors = [{name = "Aless Microsystems", email = "albertalesso@gmail.com"}]
 readme = "README.md"

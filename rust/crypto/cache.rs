@@ -26,9 +26,11 @@ use hashbrown::HashMap;
 use std::sync::{Arc, LazyLock};
 use num_bigint::BigInt;
 use std::hash::{Hash, Hasher};
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use ahash::AHasher;
+
 // Global timer for relative time tracking
 static CACHE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
     SystemTime::now()
@@ -134,7 +136,7 @@ impl CacheKey {
         match self {
             String(s) => std::mem::size_of::<std::string::String>() + s.len(),
             IntSmall(_) => std::mem::size_of::<i64>(),
-            IntBig(bi) => std::mem::size_of::<BigInt>() + (bi.bits() / 8) as usize,
+            IntBig(bi) => std::mem::size_of::<BigInt>() + ((bi.bits() + 7) / 8) as usize,
             None => std::mem::size_of::<()>(),
             Tuple(parts) => {
                 std::mem::size_of::<Box<[CacheKey]>>() + 
@@ -217,6 +219,7 @@ pub struct CacheEntry {
     original_key: Py<PyAny>,
     prefix_arcs: Option<Vec<Arc<CacheKey>>>,
     node: Option<Py<RustCacheNode>>,  // Auto-created node for global eviction
+    node_id: Option<u64>,  // Global eviction node ID
 }
 
 /// Rust-based cache node for global eviction tracking
@@ -230,10 +233,6 @@ pub struct RustCacheNode {
     last_access_time: AtomicU64,
     creation_time: u64,
     access_count: AtomicU64,
-    // Global eviction list management
-    prev_node: Option<u64>,
-    next_node: Option<u64>,
-    in_global_list: bool,
 }
 
 static NODE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -246,18 +245,11 @@ impl CacheEntry {
             original_key,
             prefix_arcs: None,
             node: None,
+            node_id: None,
         }
     }
     
-    fn new_with_node(value: Py<PyAny>, original_key: Py<PyAny>, node: Py<RustCacheNode>) -> Self {
-        Self {
-            value,
-            callbacks: None,
-            original_key,
-            prefix_arcs: None,
-            node: Some(node),
-        }
-    }
+
     
     /// Estimate memory usage of this cache entry
     fn memory_size(&self) -> usize {
@@ -282,56 +274,16 @@ impl CacheEntry {
         size
     }
     
-    /// Add callbacks with deduplication like original LruCache
-    fn add_callbacks(&mut self, py: Python, new_callbacks: Vec<Py<PyAny>>) -> PyResult<()> {
-        if new_callbacks.is_empty() {
-            return Ok(());
+    /// Add callbacks with deduplication - deduplication done outside locks
+    fn add_callbacks_deduped(&mut self, deduped_callbacks: Vec<Py<PyAny>>) {
+        if deduped_callbacks.is_empty() {
+            return;
         }
         
-        if self.callbacks.is_none() {
-            self.callbacks = Some(Vec::new());
+        match &mut self.callbacks {
+            Some(existing) => existing.extend(deduped_callbacks),
+            None => self.callbacks = Some(deduped_callbacks),
         }
-        
-        let callbacks = self.callbacks.as_mut().unwrap();
-        
-        // Use HashSet for O(n) deduplication instead of O(n²)
-        let mut seen_hashes = HashSet::new();
-        
-        // Hash existing callbacks
-        for existing_cb in callbacks.iter() {
-            if let Ok(hash) = existing_cb.bind(py).hash() {
-                seen_hashes.insert(hash);
-            }
-        }
-        
-        // Add new callbacks if not already seen
-        for new_cb in new_callbacks {
-            if let Ok(hash) = new_cb.bind(py).hash() {
-                if seen_hashes.insert(hash) {
-                    callbacks.push(new_cb);
-                }
-            } else {
-                // Fallback to linear search for unhashable callbacks
-                let mut is_duplicate = false;
-                for existing_cb in callbacks.iter() {
-                    match existing_cb.bind(py).eq(&new_cb.bind(py)) {
-                        Ok(true) => {
-                            is_duplicate = true;
-                            break;
-                        }
-                        Ok(false) => continue,
-                        Err(_) => {
-                            // If comparison fails, assume not duplicate to avoid data loss
-                            continue;
-                        }
-                    }
-                }
-                if !is_duplicate {
-                    callbacks.push(new_cb);
-                }
-            }
-        }
-        Ok(())
     }
     
     /// Run and clear all callbacks
@@ -361,20 +313,183 @@ pub enum CallbackPolicy {
 }
 
 #[derive(Debug)]
-pub struct UnifiedCache {
-    name: String,
-    capacity: usize,
+struct CacheShard {
     data: FastHashMap<Arc<CacheKey>, CacheEntry>,
-    hierarchy: FastHashMap<Arc<CacheKey>, FastHashMap<Arc<CacheKey>, ()>>,
-    prefix_cache: FastHashMap<CacheKey, Arc<CacheKey>>,
-    prefix_counts: FastHashMap<CacheKey, usize>,
-    metrics: Option<Py<PyAny>>,
-    callback_policy: CallbackPolicy,
     lru_nodes: FastHashMap<Arc<CacheKey>, Box<LruNode>>,
     head: Option<Arc<CacheKey>>,
     tail: Option<Arc<CacheKey>>,
-    size_callback: Option<Py<PyAny>>,
     current_size: usize,
+}
+
+#[derive(Debug)]
+struct GlobalEvictionList {
+    head: Option<u64>,
+    tail: Option<u64>,
+    nodes: FastHashMap<u64, GlobalEvictionNode>,
+    access_counter: AtomicU64,
+}
+
+#[derive(Debug)]
+struct GlobalEvictionNode {
+    key: Arc<CacheKey>,
+    shard_index: usize,
+    prev: Option<u64>,
+    next: Option<u64>,
+    access_order: u64,
+}
+
+impl GlobalEvictionList {
+    fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            nodes: FastHashMap::default(),
+            access_counter: AtomicU64::new(0),
+        }
+    }
+    
+    fn move_to_front(&mut self, node_id: u64) {
+        if self.head == Some(node_id) { 
+            // Update access order even if already at head
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                node.access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            return; 
+        }
+        
+        let (prev, next) = if let Some(node) = self.nodes.get(&node_id) {
+            (node.prev, node.next)
+        } else {
+            return;
+        };
+        
+        // Remove from current position
+        if let Some(prev) = prev {
+            if let Some(prev_node) = self.nodes.get_mut(&prev) {
+                prev_node.next = next;
+            }
+        }
+        if let Some(next) = next {
+            if let Some(next_node) = self.nodes.get_mut(&next) {
+                next_node.prev = prev;
+            }
+        } else {
+            self.tail = prev;
+        }
+        
+        // Move to front
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.prev = None;
+            node.next = self.head;
+            node.access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        if let Some(old_head) = self.head {
+            if let Some(head_node) = self.nodes.get_mut(&old_head) {
+                head_node.prev = Some(node_id);
+            }
+        }
+        
+        self.head = Some(node_id);
+        if self.tail.is_none() {
+            self.tail = Some(node_id);
+        }
+    }
+    
+    fn add_node(&mut self, node_id: u64, key: Arc<CacheKey>, shard_index: usize) {
+        let access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+        let node = GlobalEvictionNode {
+            key: key.clone(),
+            shard_index,
+            prev: None,
+            next: self.head,
+            access_order,
+        };
+        
+        if let Some(old_head) = self.head {
+            if let Some(head_node) = self.nodes.get_mut(&old_head) {
+                head_node.prev = Some(node_id);
+            }
+        }
+        
+        self.nodes.insert(node_id, node);
+        self.head = Some(node_id);
+        if self.tail.is_none() {
+            self.tail = Some(node_id);
+        }
+        
+
+    }
+    
+    fn remove_lru(&mut self) -> Option<(Arc<CacheKey>, usize)> {
+        loop {
+            let tail_id = self.tail?;
+            if let Some(node) = self.nodes.remove(&tail_id) {
+                self.tail = node.prev;
+                if let Some(new_tail) = node.prev {
+                    if let Some(tail_node) = self.nodes.get_mut(&new_tail) {
+                        tail_node.next = None;
+                    }
+                } else {
+                    self.head = None;
+                }
+                return Some((node.key, node.shard_index));
+            }
+            // Node was stale, continue to next tail
+        }
+    }
+    
+    fn remove_node(&mut self, node_id: u64) {
+        if let Some(node) = self.nodes.remove(&node_id) {
+            if let Some(prev) = node.prev {
+                if let Some(prev_node) = self.nodes.get_mut(&prev) {
+                    prev_node.next = node.next;
+                }
+            } else {
+                self.head = node.next;
+            }
+            
+            if let Some(next) = node.next {
+                if let Some(next_node) = self.nodes.get_mut(&next) {
+                    next_node.prev = node.prev;
+                }
+            } else {
+                self.tail = node.prev;
+            }
+        }
+    }
+}
+
+/// Unified cache implementation with sharding and global eviction tracking.
+/// 
+/// ## Lock Ordering
+/// To prevent deadlocks, locks must be acquired in this order:
+/// 1. hierarchy locks (hierarchy → prefix_counts → prefix_cache)
+/// 2. shard locks (per-shard data and LRU)
+/// 3. global_eviction lock
+/// 
+/// ## Memory Accounting
+/// - `memory_usage`: Global atomic counter tracking total memory
+/// - `shard.current_size`: Per-shard size tracking
+/// - Both are updated consistently across all modification paths
+/// 
+/// ## Size vs Count Semantics
+/// - `len()`: Always returns entry count
+/// - `size()`: Returns total size when size_callback is set, otherwise same as len()
+/// - Python `__len__()`: Returns size() when size_callback is set (non-standard behavior)
+#[derive(Debug)]
+pub struct UnifiedCache {
+    name: String,
+    capacity: usize,
+    shards: Vec<RwLock<CacheShard>>,
+    shard_count: usize,
+    prefix_cache: RwLock<FastHashMap<CacheKey, Arc<CacheKey>>>,
+    prefix_counts: RwLock<FastHashMap<CacheKey, usize>>,
+    hierarchy: RwLock<FastHashMap<Arc<CacheKey>, FastHashMap<Arc<CacheKey>, ()>>>,
+    global_eviction: RwLock<GlobalEvictionList>,
+    metrics: Option<Py<PyAny>>,
+    callback_policy: CallbackPolicy,
+    size_callback: Arc<RwLock<Option<Py<PyAny>>>>,
     // Node tracking for global eviction
     enable_nodes: bool,
     // Internal stats tracking
@@ -388,26 +503,86 @@ pub struct UnifiedCache {
     prefix_invalidations: AtomicU64,
 }
 
+impl CacheShard {
+    fn new(capacity_per_shard: usize) -> Self {
+        Self {
+            data: FastHashMap::with_capacity_and_hasher(capacity_per_shard, ahash::RandomState::new()),
+            lru_nodes: FastHashMap::default(),
+            head: None,
+            tail: None,
+            current_size: 0,
+        }
+    }
+}
+
+/// Deduplicate callbacks outside of any locks to avoid Python operations under locks
+fn deduplicate_callbacks(py: Python, existing: &[Py<PyAny>], new_callbacks: Vec<Py<PyAny>>) -> Vec<Py<PyAny>> {
+    if new_callbacks.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut seen_hashes = HashSet::new();
+    
+    // Hash existing callbacks
+    for existing_cb in existing {
+        if let Ok(hash) = existing_cb.bind(py).hash() {
+            seen_hashes.insert(hash);
+        }
+    }
+    
+    let mut deduped = Vec::new();
+    for new_cb in new_callbacks {
+        if let Ok(hash) = new_cb.bind(py).hash() {
+            if seen_hashes.insert(hash) {
+                deduped.push(new_cb);
+            }
+        } else {
+            // Fallback to linear search for unhashable callbacks
+            let mut is_duplicate = false;
+            for existing_cb in existing {
+                match existing_cb.bind(py).eq(&new_cb.bind(py)) {
+                    Ok(true) => {
+                        is_duplicate = true;
+                        break;
+                    }
+                    Ok(false) => continue,
+                    Err(_) => continue,
+                }
+            }
+            if !is_duplicate {
+                deduped.push(new_cb);
+            }
+        }
+    }
+    deduped
+}
+
 impl UnifiedCache {
     /// Creates a new UnifiedCache with specified capacity and configuration.
     /// Initializes all internal data structures with optimal sizing.
     /// Time complexity: O(1).
     pub fn new(name: String, capacity: usize, metrics: Option<Py<PyAny>>, callback_policy: CallbackPolicy) -> Self {
+        Self::new_with_shards(name, capacity, metrics, callback_policy, None)
+    }
+    
+    pub fn new_with_shards(name: String, capacity: usize, metrics: Option<Py<PyAny>>, callback_policy: CallbackPolicy, shard_count: Option<usize>) -> Self {
+        let shard_count = shard_count.unwrap_or_else(|| (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / 2).max(4));
+        let capacity_per_shard = (capacity + shard_count - 1) / shard_count;
+        let shards = (0..shard_count).map(|_| RwLock::new(CacheShard::new(capacity_per_shard))).collect();
+        
         Self {
             name,
             capacity,
-            data: FastHashMap::with_capacity_and_hasher(capacity, ahash::RandomState::new()),
-            hierarchy: FastHashMap::default(),
-            prefix_cache: FastHashMap::default(),
-            prefix_counts: FastHashMap::default(),
+            shards,
+            shard_count,
+            prefix_cache: RwLock::new(FastHashMap::default()),
+            prefix_counts: RwLock::new(FastHashMap::default()),
+            hierarchy: RwLock::new(FastHashMap::default()),
+            global_eviction: RwLock::new(GlobalEvictionList::new()),
             metrics,
             callback_policy,
-            lru_nodes: FastHashMap::default(),
-            head: None,
-            tail: None,
-            size_callback: None,
-            current_size: 0,
-            enable_nodes: false,
+            size_callback: Arc::new(RwLock::new(None)),
+            enable_nodes: true,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions_size: AtomicU64::new(0),
@@ -419,28 +594,246 @@ impl UnifiedCache {
         }
     }
     
+    fn get_shard_index(&self, key: &Arc<CacheKey>) -> usize {
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shard_count
+    }
+    
+    fn move_to_front_shard(&self, shard: &mut CacheShard, key: &Arc<CacheKey>) -> bool {
+        if !shard.data.contains_key(key) || !shard.lru_nodes.contains_key(key) {
+            return false;
+        }
+        
+        if shard.head.as_ref() == Some(key) {
+            return true;
+        }
+        
+        let Some(node) = shard.lru_nodes.get(key) else { return false; };
+        let prev = node.prev.clone();
+        let next = node.next.clone();
+        
+        if let Some(prev_key) = &prev {
+            if let Some(prev_node) = shard.lru_nodes.get_mut(prev_key) {
+                prev_node.next = next.clone();
+            }
+        }
+        
+        if let Some(next_key) = &next {
+            if let Some(next_node) = shard.lru_nodes.get_mut(next_key) {
+                next_node.prev = prev.clone();
+            }
+        }
+        
+        if shard.tail.as_ref() == Some(key) {
+            shard.tail = prev;
+        }
+        
+        let Some(node) = shard.lru_nodes.get_mut(key) else { return false; };
+        node.prev = None;
+        node.next = shard.head.clone();
+        
+        if let Some(old_head) = &shard.head {
+            if let Some(head_node) = shard.lru_nodes.get_mut(old_head) {
+                head_node.prev = Some(key.clone());
+            }
+        }
+        
+        shard.head = Some(key.clone());
+        if shard.tail.is_none() {
+            shard.tail = Some(key.clone());
+        }
+        
+        true
+    }
+    
+    fn add_to_front_shard(&self, shard: &mut CacheShard, key: Arc<CacheKey>) {
+        let node = Box::new(LruNode {
+            prev: None,
+            next: shard.head.clone(),
+        });
+        
+        if let Some(old_head) = &shard.head {
+            // Update the old head's prev pointer to point to the new head
+            if let Some(head_node) = shard.lru_nodes.get_mut(old_head) {
+                head_node.prev = Some(key.clone());
+            }
+            // Tail remains unchanged when adding to front of existing list
+        } else {
+            // First entry - set as both head and tail
+            shard.tail = Some(key.clone());
+        }
+        
+        shard.lru_nodes.insert(key.clone(), node);
+        shard.head = Some(key.clone());
+        
+
+    }
+    
+
+    
+    fn remove_from_lru_shard(&self, shard: &mut CacheShard, key: &Arc<CacheKey>) {
+        let Some(node) = shard.lru_nodes.get(key) else { return; };
+        let prev = node.prev.clone();
+        let next = node.next.clone();
+        
+        if let Some(prev_key) = &prev {
+            if let Some(prev_node) = shard.lru_nodes.get_mut(prev_key) {
+                prev_node.next = next.clone();
+            }
+        } else {
+            shard.head = next.clone();
+        }
+        
+        if let Some(next_key) = &next {
+            if let Some(next_node) = shard.lru_nodes.get_mut(next_key) {
+                next_node.prev = prev.clone();
+            }
+        } else {
+            shard.tail = prev;
+        }
+        
+        shard.lru_nodes.remove(key);
+    }
+    
+
+    
+    fn add_hierarchy_static(key: &Arc<CacheKey>, prefix_cache: &RwLock<FastHashMap<CacheKey, Arc<CacheKey>>>, prefix_counts: &RwLock<FastHashMap<CacheKey, usize>>, hierarchy: &RwLock<FastHashMap<Arc<CacheKey>, FastHashMap<Arc<CacheKey>, ()>>>) -> Vec<Arc<CacheKey>> {
+        let mut prefix_arcs = Vec::new();
+        if let CacheKey::Tuple(parts) = key.as_ref() {
+            for i in 1..parts.len() {
+                let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
+                
+                // Consistent lock order: hierarchy -> counts -> cache
+                let mut hier = hierarchy.write();
+                let mut counts = prefix_counts.write();
+                let mut cache = prefix_cache.write();
+                
+                *counts.entry(prefix.clone()).or_insert(0) += 1;
+                
+                let prefix_arc = if let Some(arc) = cache.get(&prefix) {
+                    arc.clone()
+                } else {
+                    let arc = Arc::new(prefix.clone());
+                    cache.insert(prefix, arc.clone());
+                    arc
+                };
+                
+                hier.entry(prefix_arc.clone())
+                    .or_insert_with(FastHashMap::default)
+                    .insert(key.clone(), ());
+                    
+                prefix_arcs.push(prefix_arc);
+            }
+        }
+        prefix_arcs
+    }
+    
+
+    
+    fn remove_hierarchy_static(key: &Arc<CacheKey>, prefix_arcs: &[Arc<CacheKey>], prefix_cache: &RwLock<FastHashMap<CacheKey, Arc<CacheKey>>>, prefix_counts: &RwLock<FastHashMap<CacheKey, usize>>, hierarchy: &RwLock<FastHashMap<Arc<CacheKey>, FastHashMap<Arc<CacheKey>, ()>>>) {
+        for prefix_arc in prefix_arcs {
+            // Consistent lock order: hierarchy -> counts -> cache
+            let mut hier = hierarchy.write();
+            let mut counts = prefix_counts.write();
+            let mut cache = prefix_cache.write();
+            
+            if let Some(children) = hier.get_mut(prefix_arc) {
+                children.remove(key);
+                if children.is_empty() {
+                    hier.remove(prefix_arc);
+                }
+            }
+            
+            if let Some(count) = counts.get_mut(prefix_arc.as_ref()) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(prefix_arc.as_ref());
+                    cache.remove(prefix_arc.as_ref());
+                }
+            }
+        }
+    }
+    
+
+    
+
+    
+
+    
     /// Enable node tracking for global eviction
     pub fn enable_node_tracking(&mut self) {
         self.enable_nodes = true;
+        
+        // Create nodes for existing entries
+        Python::with_gil(|_py| {
+            for (shard_idx, shard_lock) in self.shards.iter().enumerate() {
+                let keys_to_update: Vec<_> = {
+                    let shard = shard_lock.read();
+                    shard.data.keys().cloned().collect()
+                };
+                
+                for key in keys_to_update {
+                    let mut shard = shard_lock.write();
+                    if let Some(entry) = shard.data.get_mut(&key) {
+                        if entry.node_id.is_none() {
+                            let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            entry.node_id = Some(node_id);
+                            drop(shard);
+                            let mut global_eviction = self.global_eviction.write();
+                            global_eviction.add_node(node_id, key.clone(), shard_idx);
+                        }
+                    }
+                }
+            }
+        });
     }
     
-    /// Get all active cache nodes for global eviction
+    /// Get all active cache nodes for global eviction (only existing node objects)
     pub fn get_all_nodes(&self) -> Vec<Py<RustCacheNode>> {
         Python::with_gil(|py| {
-            self.data.values()
-                .filter_map(|entry| entry.node.as_ref())
-                .map(|node| node.clone_ref(py))
-                .collect()
+            let mut nodes = Vec::new();
+            for shard_lock in &self.shards {
+                let shard = shard_lock.read();
+                for entry in shard.data.values() {
+                    if let Some(node) = &entry.node {
+                        nodes.push(node.clone_ref(py));
+                    }
+                }
+            }
+            nodes
+        })
+    }
+    
+    /// Get all cache entries as nodes, creating node objects on demand
+    pub fn get_all_nodes_complete(&self, cache_ref: &Arc<RwLock<UnifiedCache>>) -> Vec<Py<RustCacheNode>> {
+        Python::with_gil(|py| {
+            let mut nodes = Vec::new();
+            for shard_lock in &self.shards {
+                let mut shard = shard_lock.write();
+                for (key, entry) in shard.data.iter_mut() {
+                    if let Some(node) = &entry.node {
+                        nodes.push(node.clone_ref(py));
+                    } else if let Some(node_id) = entry.node_id {
+                        // Create node on demand
+                        if let Ok(node) = self.create_eviction_node(cache_ref, py, key, &[], Some(node_id)) {
+                            entry.node = Some(node.clone_ref(py));
+                            nodes.push(node);
+                        }
+                    }
+                }
+            }
+            nodes
         })
     }
     
     /// Create a node for global eviction system integration
-    fn create_eviction_node(&self, cache_ref: &Arc<RwLock<UnifiedCache>>, py: Python, key: &Arc<CacheKey>, callbacks: &[Py<PyAny>]) -> PyResult<Py<RustCacheNode>> {
-        let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    fn create_eviction_node(&self, cache_ref: &Arc<RwLock<UnifiedCache>>, py: Python, key: &Arc<CacheKey>, callbacks: &[Py<PyAny>], existing_node_id: Option<u64>) -> PyResult<Py<RustCacheNode>> {
+        let node_id = existing_node_id.unwrap_or_else(|| NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
         let now = get_relative_time_ms();
         
         let node = RustCacheNode {
-            cache: Arc::downgrade(cache_ref), // Proper weak reference to cache
+            cache: Arc::downgrade(cache_ref),
             key: key.clone(),
             node_id,
             callbacks: if callbacks.is_empty() { 
@@ -451,9 +844,6 @@ impl UnifiedCache {
             last_access_time: AtomicU64::new(now),
             creation_time: now,
             access_count: AtomicU64::new(0),
-            prev_node: None,
-            next_node: None,
-            in_global_list: false,
         };
         
         Ok(Py::new(py, node)?)
@@ -461,433 +851,389 @@ impl UnifiedCache {
     
 
 
-    /// Moves an existing cache entry to the front of the LRU list (most recently used).
-    /// Updates doubly-linked list pointers in O(1) time using HashMap lookups.
-    /// Returns true if the key was found and moved, false otherwise.
-    /// Time complexity: O(1).
-    fn move_to_front(&mut self, key: &Arc<CacheKey>) -> bool {
-        rust_debug_fast!("move_to_front() called for key: {:?}", key);
-        // Consistency check: key must exist in both data and lru_nodes
-        if !self.data.contains_key(key) || !self.lru_nodes.contains_key(key) {
-            rust_debug_fast!("move_to_front() failed: key not found in data or lru_nodes");
-            return false;
-        }
-        
-        if self.head.as_ref() == Some(key) {
-            rust_debug_fast!("move_to_front() key already at head");
-            return true;
-        }
-        
-        let Some(node) = self.lru_nodes.get(key) else {
-            return false;
-        };
-        
-        let prev = node.prev.clone();
-        let next = node.next.clone();
-        
-        // Update previous node's next pointer - safely handle missing nodes
-        if let Some(prev_key) = &prev {
-            if let Some(prev_node) = self.lru_nodes.get_mut(prev_key) {
-                prev_node.next = next.clone();
-            }
-        }
-        
-        // Update next node's prev pointer - safely handle missing nodes
-        if let Some(next_key) = &next {
-            if let Some(next_node) = self.lru_nodes.get_mut(next_key) {
-                next_node.prev = prev.clone();
-            }
-        }
-        
-        // Update tail if this was the tail
-        if self.tail.as_ref() == Some(key) {
-            self.tail = prev;
-        }
-        
-        // Move to front - double-check node still exists
-        let Some(node) = self.lru_nodes.get_mut(key) else {
-            return false;
-        };
-        
-        node.prev = None;
-        node.next = self.head.clone();
-        
-        // Update old head's prev pointer - safely handle missing nodes
-        if let Some(old_head) = &self.head {
-            if let Some(head_node) = self.lru_nodes.get_mut(old_head) {
-                head_node.prev = Some(key.clone());
-            }
-        }
-        
-        self.head = Some(key.clone());
-        
-        if self.tail.is_none() {
-            self.tail = Some(key.clone());
-        }
-        
-        true
-    }
+
     
-    /// Removes and returns the least recently used (tail) entry from the LRU list.
-    /// Updates tail pointer and removes the node from the HashMap.
-    /// Used during cache eviction when capacity is exceeded.
-    /// Time complexity: O(1).
-    fn remove_lru(&mut self) -> Option<Arc<CacheKey>> {
-        let tail_key = self.tail.clone()?;
-        
-        // Consistency check: tail must exist in both data and lru_nodes
-        if !self.data.contains_key(&tail_key) || !self.lru_nodes.contains_key(&tail_key) {
-            // Inconsistent state - reset tail and try to recover
-            self.tail = None;
-            self.head = None;
-            return None;
-        }
-        
-        let tail_node = self.lru_nodes.get(&tail_key)?;
-        let prev = tail_node.prev.clone();
-        
-        self.tail = prev.clone();
-        
-        if let Some(new_tail) = &prev {
-            if let Some(new_tail_node) = self.lru_nodes.get_mut(new_tail) {
-                new_tail_node.next = None;
-            }
-        } else {
-            self.head = None;
-        }
-        
-        self.lru_nodes.remove(&tail_key);
-        Some(tail_key)
-    }
+
     
-    /// Adds a new entry to the front of the LRU list (most recently used position).
-    /// Creates new LruNode and updates head/tail pointers as needed.
-    /// Time complexity: O(1).
-    fn add_to_front(&mut self, key: Arc<CacheKey>) {
-        let node = Box::new(LruNode {
-            prev: None,
-            next: self.head.clone(),
-        });
-        
-        if let Some(old_head) = &self.head {
-            if let Some(head_node) = self.lru_nodes.get_mut(old_head) {
-                head_node.prev = Some(key.clone());
-            }
-        }
-        
-        self.lru_nodes.insert(key.clone(), node);
-        self.head = Some(key.clone());
-        
-        if self.tail.is_none() {
-            self.tail = Some(key);
-        }
-    }
+
     
-    /// Removes a specific entry from the LRU doubly-linked list.
-    /// Updates prev/next pointers of adjacent nodes and head/tail as needed.
-    /// Time complexity: O(1).
-    fn remove_from_lru(&mut self, key: &Arc<CacheKey>) {
-        let Some(node) = self.lru_nodes.get(key) else {
-            return;
-        };
-        
-        let prev = node.prev.clone();
-        let next = node.next.clone();
-        
-        if let Some(prev_key) = &prev {
-            if let Some(prev_node) = self.lru_nodes.get_mut(prev_key) {
-                prev_node.next = next.clone();
-            }
-        } else {
-            self.head = next.clone();
-        }
-        
-        if let Some(next_key) = &next {
-            if let Some(next_node) = self.lru_nodes.get_mut(next_key) {
-                next_node.prev = prev.clone();
-            }
-        } else {
-            self.tail = prev;
-        }
-        
-        self.lru_nodes.remove(key);
-    }
+
     
-    /// Gets or creates an Arc<CacheKey> for a prefix with reference counting.
-    /// Implements prefix interning to avoid duplicate Arc allocations.
-    /// Increments reference count for existing prefixes.
-    /// Time complexity: O(1).
-    fn get_or_create_prefix(&mut self, prefix: CacheKey) -> Arc<CacheKey> {
-        *self.prefix_counts.entry(prefix.clone()).or_insert(0) += 1;
-        
-        if let Some(arc) = self.prefix_cache.get(&prefix) {
-            arc.clone()
-        } else {
-            let arc = Arc::new(prefix.clone());
-            self.prefix_cache.insert(prefix, arc.clone());
-            arc
-        }
-    }
+
     
-    /// Decrements reference count for a prefix and cleans up if count reaches zero.
-    /// Removes prefix from both prefix_cache and prefix_counts when no longer used.
-    /// Time complexity: O(1).
-    fn release_prefix(&mut self, prefix: &CacheKey) {
-        if let Some(count) = self.prefix_counts.get_mut(prefix) {
-            *count -= 1;
-            if *count == 0 {
-                self.prefix_counts.remove(prefix);
-                self.prefix_cache.remove(prefix);
-            }
-        }
-    }
-    
-    /// Adds tuple key to hierarchy by creating all prefix relationships.
-    /// Returns Vec of prefix Arcs for storage in CacheEntry.
-    /// Time complexity: O(k) where k is tuple length.
-    fn add_hierarchy(&mut self, key: &Arc<CacheKey>) -> Vec<Arc<CacheKey>> {
-        let mut prefix_arcs = Vec::new();
-        if let CacheKey::Tuple(parts) = key.as_ref() {
-            for i in 1..parts.len() {
-                let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
-                let prefix_arc = self.get_or_create_prefix(prefix);
-                self.hierarchy
-                    .entry(prefix_arc.clone())
-                    .or_insert_with(FastHashMap::default)
-                    .insert(key.clone(), ());
-                prefix_arcs.push(prefix_arc);
-            }
-        }
-        prefix_arcs
-    }
-    
-    /// Removes tuple key from hierarchy using stored prefix references.
-    /// No allocations or HashMap lookups needed.
-    /// Time complexity: O(k) where k is tuple length.
-    fn remove_hierarchy_fast(&mut self, key: &Arc<CacheKey>, prefix_arcs: Option<&Vec<Arc<CacheKey>>>) {
-        let Some(arcs) = prefix_arcs else {
-            return;
-        };
-        
-        for prefix_arc in arcs {
-            if let Some(children) = self.hierarchy.get_mut(prefix_arc) {
-                children.remove(key);
-                if children.is_empty() {
-                    self.hierarchy.remove(prefix_arc);
-                }
-            }
-            self.release_prefix(prefix_arc);
-        }
-    }
+
     
     /// Invalidates all cache entries that have the specified prefix.
-    /// Removes all children from the hierarchy and returns the removed entries.
-    /// Time complexity: O(children) where children is the number of matching entries.
-    fn invalidate_prefix(&mut self, py: Python, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
+    pub fn invalidate_prefix(&self, py: Python, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
         let mut removed_entries = Vec::new();
-        let mut removed_count = 0;
         
-        if let Some(children) = self.hierarchy.get(prefix_key) {
-            let child_keys: Vec<_> = children.keys().cloned().collect();
-            for child_key in child_keys {
-                if let Some(entry) = self.data.remove(&child_key) {
-                    // Update size tracking for removed entry
-                    if self.size_callback.is_some() {
-                        let entry_size = self.calculate_size(py, &entry.value).unwrap_or(DEFAULT_ENTRY_SIZE);
-                        self.current_size = self.current_size.saturating_sub(entry_size);
-                        self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
-                    }
-                    
-                    self.remove_from_lru(&child_key);
-                    // Clean up hierarchy state for each removed child
-                    self.remove_hierarchy_fast(&child_key, entry.prefix_arcs.as_ref());
-                    removed_entries.push((child_key, entry));
-                    removed_count += 1;
-                } else {
-                    // Fallback: reconstruct arcs from the child key to release prefix refs
-                    if let CacheKey::Tuple(parts) = child_key.as_ref() {
-                        for i in 1..parts.len() {
-                            let prefix = CacheKey::Tuple(parts[0..i].to_vec().into_boxed_slice());
-                            let prefix_arc = if let Some(a) = self.prefix_cache.get(&prefix) {
-                                a.clone()
-                            } else {
-                                Arc::new(prefix.clone())
-                            };
-                            if let Some(children_map) = self.hierarchy.get_mut(&prefix_arc) {
-                                children_map.remove(&child_key);
-                                if children_map.is_empty() {
-                                    self.hierarchy.remove(&prefix_arc);
-                                }
-                            }
-                            self.release_prefix(&prefix);
-                        }
-                    }
-                    self.remove_from_lru(&child_key);
-                }
+        // Get children from global hierarchy
+        let child_keys: Vec<_> = {
+            let hierarchy = self.hierarchy.read();
+            if let Some(children) = hierarchy.get(prefix_key) {
+                children.keys().cloned().collect()
+            } else {
+                Vec::new()
             }
-            self.hierarchy.remove(prefix_key);
+        };
+        
+        // Remove entries from appropriate shards
+        for child_key in child_keys {
+            let shard_index = self.get_shard_index(&child_key);
+            
+            // Copy value and remove entry under lock
+            let (entry, value_copy) = {
+                let mut shard = self.shards[shard_index].write();
+                if let Some(entry) = shard.data.remove(&child_key) {
+                    let value_copy = entry.value.clone_ref(py);
+                    self.remove_from_lru_shard(&mut shard, &child_key);
+                    (Some(entry), Some(value_copy))
+                } else {
+                    (None, None)
+                }
+            };
+            
+            if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+                // Calculate size outside lock
+                let size = if self.size_callback.read().is_some() {
+                    self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                } else {
+                    DEFAULT_ENTRY_SIZE
+                };
+                
+                // Update size tracking
+                {
+                    let mut shard = self.shards[shard_index].write();
+                    shard.current_size = shard.current_size.saturating_sub(size);
+                }
+                self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                
+                // Remove from global eviction list
+                if let Some(node_id) = entry.node_id {
+                    let mut global_eviction = self.global_eviction.write();
+                    global_eviction.remove_node(node_id);
+                }
+                
+                let prefix_arcs = entry.prefix_arcs.clone();
+                if let Some(arcs) = prefix_arcs.as_ref() {
+                    Self::remove_hierarchy_static(&child_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                }
+                removed_entries.push((child_key, entry));
+            }
         }
         
-        // Update prefix invalidation stats
-        self.prefix_invalidations.fetch_add(removed_count, Ordering::Relaxed);
-        
+        self.prefix_invalidations.fetch_add(removed_entries.len() as u64, Ordering::Relaxed);
         removed_entries
     }
     
     /// Removes and returns a cache entry, or returns default if not found.
-    /// Uses stored prefix references for O(k) cleanup without allocations.
-    /// Returns (value, callbacks) tuple for callback execution.
-    /// Time complexity: O(k) where k is tuple length.
-    pub fn pop(&mut self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<(Py<PyAny>, Vec<Py<PyAny>>)> {
+    pub fn pop(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<(Py<PyAny>, Vec<Py<PyAny>>)> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let shard_index = self.get_shard_index(&cache_key);
         
-        if let Some(entry) = self.data.remove(&cache_key) {
-            // Update size tracking for removed entry
-            if self.size_callback.is_some() {
-                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
-                self.current_size = self.current_size.saturating_sub(entry_size);
-                self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
+        // Copy value and remove entry under lock
+        let (entry, value_copy) = {
+            let mut shard = self.shards[shard_index].write();
+            if let Some(entry) = shard.data.remove(&cache_key) {
+                let value_copy = entry.value.clone_ref(py);
+                self.remove_from_lru_shard(&mut shard, &cache_key);
+                (Some(entry), Some(value_copy))
+            } else {
+                (None, None)
+            }
+        };
+        
+        if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+            // Calculate size outside lock
+            let size = if self.size_callback.read().is_some() {
+                self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+            } else {
+                DEFAULT_ENTRY_SIZE
+            };
+            
+            // Update size tracking
+            {
+                let mut shard = self.shards[shard_index].write();
+                shard.current_size = shard.current_size.saturating_sub(size);
+            }
+            self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+            
+            let callbacks = entry.get_callbacks();
+            let value = entry.value;
+            let prefix_arcs = entry.prefix_arcs.clone();
+            
+            // Remove from global eviction list
+            if let Some(node_id) = entry.node_id {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_node(node_id);
             }
             
-            self.remove_from_lru(&cache_key);
-            self.remove_hierarchy_fast(&cache_key, entry.prefix_arcs.as_ref());
-            let callbacks = entry.get_callbacks();
-            Ok((entry.value, callbacks))
+            if let Some(arcs) = prefix_arcs.as_ref() {
+                Self::remove_hierarchy_static(&cache_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+            }
+            Ok((value, callbacks))
         } else {
             Ok((default.unwrap_or_else(|| py.None()), Vec::new()))
         }
     }
     
     /// Removes and returns the least recently used cache entry.
-    /// Pure LRU design: if no tail exists, cache is empty.
-    /// Returns (original_key, value, callbacks) tuple.
-    /// Time complexity: O(k) where k is tuple length for hierarchy cleanup.
-    fn popitem(&mut self, _py: Python) -> Option<(Py<PyAny>, Py<PyAny>, Vec<Py<PyAny>>)> {
-        rust_debug_fast!("popitem() called, tail: {:?}", self.tail);
-        let lru_key = self.remove_lru()?;
-        rust_debug_fast!("popitem() removing LRU key: {:?}", lru_key);
-        let entry = self.data.remove(&lru_key)?;
-        
-        // Update size tracking for removed entry
-        if self.size_callback.is_some() {
-            let entry_size = self.calculate_size(_py, &entry.value).unwrap_or(DEFAULT_ENTRY_SIZE);
-            self.current_size = self.current_size.saturating_sub(entry_size);
-            self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
+    pub fn popitem(&self, py: Python) -> Option<(Py<PyAny>, Py<PyAny>, Vec<Py<PyAny>>)> {
+        // Loop until we find a live entry or the list is empty
+        loop {
+            let evict_info = {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_lru()
+            };
+            
+            let Some((lru_key, shard_idx)) = evict_info else {
+                return None; // No more entries
+            };
+            
+            // Copy value and remove entry under lock
+            let (entry, value_copy) = {
+                let mut shard = self.shards[shard_idx].write();
+                if let Some(entry) = shard.data.remove(&lru_key) {
+                    let value_copy = entry.value.clone_ref(py);
+                    self.remove_from_lru_shard(&mut shard, &lru_key);
+                    (Some(entry), Some(value_copy))
+                } else {
+                    (None, None) // Stale node, continue loop
+                }
+            };
+            
+            if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+                // Calculate size outside lock
+                let size = if self.size_callback.read().is_some() {
+                    self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                } else {
+                    DEFAULT_ENTRY_SIZE
+                };
+                
+                // Update size tracking
+                {
+                    let mut shard = self.shards[shard_idx].write();
+                    shard.current_size = shard.current_size.saturating_sub(size);
+                }
+                self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                self.evictions_size.fetch_add(1, Ordering::Relaxed);
+                
+                let callbacks = entry.get_callbacks();
+                let original_key = entry.original_key;
+                let value = entry.value;
+                let prefix_arcs = entry.prefix_arcs.clone();
+                
+                // Remove hierarchy after getting entry data
+                if let Some(arcs) = prefix_arcs.as_ref() {
+                    Self::remove_hierarchy_static(&lru_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                }
+                
+                return Some((original_key, value, callbacks));
+            }
+            // Entry was stale, continue to next LRU entry
         }
-        
-        // Track eviction stats
-        self.evictions_size.fetch_add(1, Ordering::Relaxed);
-        
-        self.remove_hierarchy_fast(&lru_key, entry.prefix_arcs.as_ref());
-        rust_debug_fast!("popitem() removed entry, callbacks count: {}", entry.get_callbacks().len());
-        let callbacks = entry.get_callbacks();
-        let original_key = entry.original_key;
-        let value = entry.value;
-        Some((original_key, value, callbacks))
     }
     
     /// Inserts or updates a cache entry with the specified key and value.
     /// Handles capacity management by evicting LRU entries when needed.
     /// Updates LRU position and hierarchy relationships for tuple keys.
     /// Time complexity: O(k) where k is tuple length for hierarchy operations.
-    pub fn set(&mut self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>, callbacks: Vec<Py<PyAny>>) -> PyResult<Vec<Py<PyAny>>> {
-        rust_debug_fast!("UnifiedCache::set() called");
+    pub fn set(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>, callbacks: Vec<Py<PyAny>>) -> PyResult<Vec<Py<PyAny>>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let shard_index = self.get_shard_index(&cache_key);
+
         let original_key = key.clone().unbind();
         let mut evicted_callbacks = Vec::new();
         
         // Track set operations
         self.sets.fetch_add(1, Ordering::Relaxed);
         
-        if self.data.contains_key(&cache_key) {
-            rust_debug_fast!("Key exists, updating entry");
-            
-            // Calculate sizes before getting mutable reference
-            let (old_size, new_size) = if self.size_callback.is_some() {
-                let old_val = self.data.get(&cache_key).map(|e| &e.value);
-                let old_size = if let Some(old_val) = old_val {
-                    self.calculate_size(py, old_val).unwrap_or(DEFAULT_ENTRY_SIZE)
-                } else {
-                    DEFAULT_ENTRY_SIZE
-                };
-                let new_size = self.calculate_size(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE);
-                (old_size, new_size)
+        // Check if entry exists and collect data for size/equality calculations
+        let (entry_exists, old_value, existing_callbacks) = {
+            let shard = self.shards[shard_index].read();
+            if let Some(entry) = shard.data.get(&cache_key) {
+                (true, Some(entry.value.clone_ref(py)), entry.get_callbacks())
             } else {
-                (0, 0)
+                (false, None, Vec::new())
+            }
+        };
+        
+        if entry_exists {
+            // Calculate size difference and value equality outside locks
+            let size_diff = if self.size_callback.read().is_some() {
+                if let Some(old_val) = &old_value {
+                    let old_size = self.calculate_size_unlocked(py, old_val).unwrap_or(DEFAULT_ENTRY_SIZE);
+                    let new_size = self.calculate_size_unlocked(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE);
+                    Some(new_size as i64 - old_size as i64)
+                } else {
+                    None
+                }
+            } else {
+                None
             };
             
-            if let Some(entry) = self.data.get_mut(&cache_key) {
-                // Check if value changed and run callbacks if so (Python LruCache behavior)
-                let value_changed = !entry.value.bind(py).eq(&value.bind(py)).unwrap_or(false);
-                if value_changed {
-                    entry.run_and_clear_callbacks(py);
-                }
-                
-                // Update size tracking for existing entry
-                if self.size_callback.is_some() {
-                    self.current_size = self.current_size.saturating_sub(old_size).saturating_add(new_size);
-                    let signed = new_size as i64 - old_size as i64;
-                    if signed >= 0 {
-                        self.memory_usage.fetch_add(signed as u64, Ordering::Relaxed);
+            let value_changed = if let Some(old_val) = &old_value {
+                !old_val.bind(py).eq(&value.bind(py)).unwrap_or(false)
+            } else {
+                true
+            };
+            
+            // Deduplicate callbacks outside locks
+            let deduped_callbacks = match self.callback_policy {
+                CallbackPolicy::Replace => callbacks,
+                CallbackPolicy::Append => {
+                    if callbacks.is_empty() {
+                        Vec::new()
                     } else {
-                        self.memory_usage.fetch_sub((-signed) as u64, Ordering::Relaxed);
+                        deduplicate_callbacks(py, &existing_callbacks, callbacks)
                     }
                 }
+            };
+            
+            // Update entry under lock
+            let change_callbacks = {
+                let mut shard = self.shards[shard_index].write();
+                let mut change_cbs = Vec::new();
                 
-                entry.value = value;
-                // Handle callback updates based on policy
-                match self.callback_policy {
-                    CallbackPolicy::Replace => {
-                        if !callbacks.is_empty() {
-                            entry.callbacks = Some(callbacks);
+                if let Some(entry) = shard.data.get_mut(&cache_key) {
+                    if value_changed {
+                        change_cbs.extend(entry.get_callbacks());
+                        entry.callbacks = None;
+                    }
+                    
+                    entry.value = value.clone_ref(py);
+                    
+                    match self.callback_policy {
+                        CallbackPolicy::Replace => {
+                            if !deduped_callbacks.is_empty() {
+                                entry.callbacks = Some(deduped_callbacks);
+                            }
+                        },
+                        CallbackPolicy::Append => {
+                            entry.add_callbacks_deduped(deduped_callbacks);
+                        },
+                    }
+                    
+                    // Update size tracking
+                    if let Some(diff) = size_diff {
+                        if diff > 0 {
+                            shard.current_size += diff as usize;
+                            self.memory_usage.fetch_add(diff as u64, Ordering::Relaxed);
+                        } else if diff < 0 {
+                            shard.current_size = shard.current_size.saturating_sub((-diff) as usize);
+                            self.memory_usage.fetch_sub((-diff) as u64, Ordering::Relaxed);
                         }
-                        // If empty, preserve existing callbacks (Python LruCache behavior)
-                    },
-                    CallbackPolicy::Append => {
-                        entry.add_callbacks(py, callbacks)?;
-                    },
+                    }
+                    
+                    self.move_to_front_shard(&mut shard, &cache_key);
+                }
+                
+                change_cbs
+            };
+            
+            // Execute change callbacks outside the lock
+            for callback in change_callbacks {
+                if let Err(e) = callback.bind(py).call0() {
+                    eprintln!("Cache callback error: {}", e);
                 }
             }
-            
-            if !self.move_to_front(&cache_key) {
-                self.add_to_front(cache_key);
-            }
         } else {
-            rust_debug_fast!("New key, inserting entry");
-            // Calculate new entry size for eviction logic
-            let new_entry_size = if self.size_callback.is_some() {
-                self.calculate_size(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE)
+
+            // Add hierarchy outside of shard lock to maintain consistent lock order
+            let prefix_arcs = Self::add_hierarchy_static(&cache_key, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+            
+            // Calculate size outside lock
+            let entry_size = if self.size_callback.read().is_some() {
+                self.calculate_size_unlocked(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE)
             } else {
                 DEFAULT_ENTRY_SIZE
             };
             
-            // Evict LRU entries until we have space for the new entry
-            while (if self.size_callback.is_some() { self.current_size + new_entry_size } else { self.data.len() + 1 }) > self.capacity {
-                rust_debug_fast!("Cache full, evicting LRU entry. Current size: {}, new entry size: {}, capacity: {}", self.len(), new_entry_size, self.capacity);
-                if let Some((_, _, callbacks)) = self.popitem(py) {
-                    rust_debug_fast!("Evicted entry with {} callbacks", callbacks.len());
-                    evicted_callbacks.extend(callbacks);
+            // Insert entry under lock
+            let node_id = {
+                let mut shard = self.shards[shard_index].write();
+                
+                let mut entry = CacheEntry::new(value.clone_ref(py), original_key);
+                entry.callbacks = if callbacks.is_empty() { None } else { Some(callbacks) };
+                entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
+                
+                // Update size tracking
+                shard.current_size += entry_size;
+                self.memory_usage.fetch_add(entry_size as u64, Ordering::Relaxed);
+                
+                // Add to global eviction list
+                let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                entry.node_id = Some(node_id);
+                
+                shard.data.insert(cache_key.clone(), entry);
+                self.add_to_front_shard(&mut shard, cache_key.clone());
+                
+                node_id
+            };
+            
+            // Add to global eviction outside shard lock
+            {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.add_node(node_id, cache_key.clone(), shard_index);
+            };
+            
+            // Evict LRU entries after insertion
+            let mut eviction_attempts = 0;
+            let max_eviction_attempts = self.capacity + 10;
+            
+            let use_size_based = self.size_callback.read().is_some();
+            while (if use_size_based { self.size() } else { self.len() }) > self.capacity && eviction_attempts < max_eviction_attempts {
+                eviction_attempts += 1;
+                
+                // Get LRU entry to evict
+                let evict_info = {
+                    let mut global_eviction = self.global_eviction.write();
+                    global_eviction.remove_lru()
+                };
+                
+                if let Some((lru_key, shard_idx)) = evict_info {
+                    // Copy value and remove entry under lock
+                    let (entry_data, value_copy) = {
+                        let mut shard = self.shards[shard_idx].write();
+                        if let Some(entry) = shard.data.remove(&lru_key) {
+                            let value_copy = if use_size_based {
+                                Some(entry.value.clone_ref(py))
+                            } else {
+                                None
+                            };
+                            self.remove_from_lru_shard(&mut shard, &lru_key);
+                            self.evictions_size.fetch_add(1, Ordering::Relaxed);
+                            
+                            (Some((entry.get_callbacks(), entry.prefix_arcs.clone())), value_copy)
+                        } else {
+                            (None, None)
+                        }
+                    };
+                    
+                    if let Some((callbacks, prefix_arcs)) = entry_data {
+                        // Calculate size outside lock
+                        let size = if let Some(value_copy) = value_copy {
+                            self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                        } else {
+                            DEFAULT_ENTRY_SIZE
+                        };
+                        
+                        // Update size tracking
+                        {
+                            let mut shard = self.shards[shard_idx].write();
+                            shard.current_size = shard.current_size.saturating_sub(size);
+                        }
+                        self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                        
+                        evicted_callbacks.extend(callbacks);
+                        if let Some(arcs) = prefix_arcs.as_ref() {
+                            Self::remove_hierarchy_static(&lru_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                        }
+                    }
                 } else {
-                    rust_debug_fast!("popitem() returned None, breaking eviction loop");
                     break; // No more entries to evict
                 }
             }
-            
-            let prefix_arcs = self.add_hierarchy(&cache_key);
-            
-            // Update size tracking for new entry (size already calculated above)
-            if self.size_callback.is_some() {
-                self.current_size = self.current_size.saturating_add(new_entry_size);
-                self.memory_usage.fetch_add(new_entry_size as u64, Ordering::Relaxed);
-            }
-            
-            // Auto-create node for global eviction if enabled
-            let mut entry = CacheEntry::new(value, original_key);
-            entry.callbacks = if callbacks.is_empty() { None } else { Some(callbacks) };
-            entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
-            
-            self.data.insert(cache_key.clone(), entry);
-            self.add_to_front(cache_key);
         }
         
         rust_debug_fast!("UnifiedCache::set() completed");
@@ -897,67 +1243,74 @@ impl UnifiedCache {
     /// Retrieves a cache entry and optionally updates its LRU position and metrics.
     /// Records cache hit/miss metrics if metrics are configured and update_metrics is true.
     /// Time complexity: O(1) for HashMap lookup and LRU update.
-    pub fn get(&mut self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>, update_metrics: bool, update_last_access: bool) -> PyResult<Option<Py<PyAny>>> {
-        rust_debug_fast!("UnifiedCache::get() called");
+    pub fn get(&self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>, update_metrics: bool, update_last_access: bool) -> PyResult<Option<Py<PyAny>>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let shard_index = self.get_shard_index(&cache_key);
+
+        // First, check if entry exists and get data for callback deduplication
+        let (value, existing_callbacks, node_id) = {
+            let shard = self.shards[shard_index].read();
+            if let Some(entry) = shard.data.get(&cache_key) {
+                let value = entry.value.clone_ref(py);
+                let existing_cbs = entry.get_callbacks();
+                let node_id = if update_last_access { entry.node_id } else { None };
+                (Some(value), existing_cbs, node_id)
+            } else {
+                (None, Vec::new(), None)
+            }
+        };
         
-        // Check for inconsistent state between data and lru_nodes
-        let data_exists = self.data.contains_key(&cache_key);
-        let lru_exists = self.lru_nodes.contains_key(&cache_key);
-        
-        if data_exists != lru_exists {
-            rust_debug_fast!("Consistency error detected in get() - data: {}, lru: {}", data_exists, lru_exists);
-            self.check_consistency();
-            // Re-check after consistency repair
-            if !self.data.contains_key(&cache_key) {
-                if update_metrics {
-                    self.misses.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref metrics) = self.metrics {
-                        let _ = metrics.bind(py).call_method0("inc_misses");
+        if let Some(value) = value {
+            // Deduplicate callbacks outside locks if needed
+            let deduped_callbacks = if let Some(new_callbacks) = callbacks {
+                if new_callbacks.is_empty() {
+                    Vec::new()
+                } else {
+                    match self.callback_policy {
+                        CallbackPolicy::Replace => new_callbacks,
+                        CallbackPolicy::Append => deduplicate_callbacks(py, &existing_callbacks, new_callbacks),
                     }
                 }
-                return Ok(None);
-            }
-        }
-        
-        if let Some(entry) = self.data.get_mut(&cache_key) {
-            rust_debug_fast!("Cache hit, returning value");
-            let value = entry.value.clone_ref(py);
+            } else {
+                Vec::new()
+            };
             
-            // Add callbacks if provided (Python LruCache behavior)
-            if let Some(new_callbacks) = callbacks {
-                match self.callback_policy {
-                    CallbackPolicy::Replace => {
-                        if !new_callbacks.is_empty() {
-                            entry.callbacks = Some(new_callbacks);
+            // Update callbacks and LRU under lock
+            if !deduped_callbacks.is_empty() || update_last_access {
+                let mut shard = self.shards[shard_index].write();
+                if let Some(entry) = shard.data.get_mut(&cache_key) {
+                    if !deduped_callbacks.is_empty() {
+                        match self.callback_policy {
+                            CallbackPolicy::Replace => {
+                                entry.callbacks = Some(deduped_callbacks);
+                            },
+                            CallbackPolicy::Append => {
+                                entry.add_callbacks_deduped(deduped_callbacks);
+                            },
                         }
-                        // If empty, preserve existing callbacks (Python add_callbacks behavior)
-                    },
-                    CallbackPolicy::Append => {
-                        entry.add_callbacks(py, new_callbacks)?;
-                    },
+                    }
+                    
+                    if update_last_access {
+                        self.move_to_front_shard(&mut shard, &cache_key);
+                    }
                 }
             }
             
-            // Update LRU position only if requested
-            if update_last_access {
-                if !self.move_to_front(&cache_key) {
-                    // If move_to_front fails, try adding to front as fallback
-                    self.add_to_front(cache_key);
-                }
+            // Update global eviction list outside shard lock
+            if let Some(node_id) = node_id {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.move_to_front(node_id);
             }
             
-            // Record metrics only if requested
+            // Record metrics
             if update_metrics {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 if let Some(ref metrics) = self.metrics {
                     let _ = metrics.bind(py).call_method0("inc_hits");
                 }
             }
-            
             Ok(Some(value))
         } else {
-            rust_debug_fast!("Cache miss");
             if update_metrics {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 if let Some(ref metrics) = self.metrics {
@@ -971,68 +1324,105 @@ impl UnifiedCache {
     /// Removes a cache entry and performs full cleanup.
     /// Returns (found, callbacks) tuple indicating success and any callbacks to execute.
     /// Time complexity: O(k) where k is tuple length for hierarchy cleanup.
-    pub fn invalidate(&mut self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
+    pub fn invalidate(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
         rust_debug_fast!("UnifiedCache::invalidate() called");
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         self.invalidate_by_key(py, &cache_key)
     }
     
     /// Invalidates a cache entry by its CacheKey directly
-    pub fn invalidate_by_key(&mut self, py: Python, key: &Arc<CacheKey>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
-        if let Some(entry) = self.data.remove(key) {
-            rust_debug_fast!("Entry found, removing from cache and LRU");
-            
-            // Update size tracking for removed entry
-            if self.size_callback.is_some() {
-                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(1);
-                self.current_size = self.current_size.saturating_sub(entry_size);
-                self.memory_usage.fetch_sub(entry_size as u64, Ordering::Relaxed);
+    pub fn invalidate_by_key(&self, py: Python, key: &Arc<CacheKey>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
+        let shard_index = self.get_shard_index(key);
+        
+        // Copy value and remove entry under lock
+        let (entry, value_copy) = {
+            let mut shard = self.shards[shard_index].write();
+            if let Some(entry) = shard.data.remove(key) {
+                rust_debug_fast!("Entry found, removing from cache and LRU");
+                let value_copy = entry.value.clone_ref(py);
+                self.remove_from_lru_shard(&mut shard, key);
+                (Some(entry), Some(value_copy))
+            } else {
+                rust_debug_fast!("Entry not found");
+                (None, None)
             }
+        };
+        
+        if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+            // Calculate size outside lock
+            let size = if self.size_callback.read().is_some() {
+                self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+            } else {
+                DEFAULT_ENTRY_SIZE
+            };
             
-            // Track invalidation stats
+            // Update size tracking
+            {
+                let mut shard = self.shards[shard_index].write();
+                shard.current_size = shard.current_size.saturating_sub(size);
+            }
+            self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
             self.evictions_invalidation.fetch_add(1, Ordering::Relaxed);
             
-            self.remove_from_lru(key);
-            self.remove_hierarchy_fast(key, entry.prefix_arcs.as_ref());
+            // Remove from global eviction list
+            if let Some(node_id) = entry.node_id {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_node(node_id);
+            }
+            
+            // Get prefix arcs and remove hierarchy
+            let prefix_arcs = entry.prefix_arcs.clone();
+            if let Some(arcs) = prefix_arcs.as_ref() {
+                Self::remove_hierarchy_static(key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+            }
+            
             Ok((true, entry.get_callbacks()))
         } else {
-            rust_debug_fast!("Entry not found");
             Ok((false, Vec::new()))
         }
     }
     
     /// Gets a cache entry by its CacheKey directly
-    pub fn get_by_key(&self, key: &Arc<CacheKey>) -> Option<&CacheEntry> {
-        self.data.get(key)
+    pub fn get_by_key(&self, key: &Arc<CacheKey>) -> bool {
+        let shard_index = self.get_shard_index(key);
+        self.shards[shard_index].read().data.contains_key(key)
     }
     
     /// Updates LRU position for a key without returning the value
-    pub fn touch_key(&mut self, key: &Arc<CacheKey>) {
-        if self.data.contains_key(key) {
-            self.move_to_front(key);
+    pub fn touch_key(&self, key: &Arc<CacheKey>) {
+        let shard_index = self.get_shard_index(key);
+        let mut shard = self.shards[shard_index].write();
+        if shard.data.contains_key(key) {
+            self.move_to_front_shard(&mut shard, key);
         }
     }
     
     /// Removes all entries from the cache and resets all internal state.
     /// Collects all callbacks from removed entries for execution.
     /// Time complexity: O(n) where n is the number of cache entries.
-    pub fn clear(&mut self, py: Python) -> (usize, Vec<Py<PyAny>>) {
+    pub fn clear(&self, py: Python) -> (usize, Vec<Py<PyAny>>) {
         let count = self.len();
         rust_debug_fast!("UnifiedCache::clear() called for cache '{}' with {} entries", self.name, count);
         
         let mut all_callbacks = Vec::new();
-        for entry in self.data.values() {
-            all_callbacks.extend(entry.get_callbacks().iter().map(|cb| cb.clone_ref(py)));
+        
+        // Clear all shards
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            for entry in shard.data.values() {
+                all_callbacks.extend(entry.get_callbacks().iter().map(|cb| cb.clone_ref(py)));
+            }
+            shard.data.clear();
+            // Hierarchy is now global, cleared above
+            shard.lru_nodes.clear();
+            shard.head = None;
+            shard.tail = None;
+            shard.current_size = 0;
         }
         
-        self.data.clear();
-        self.hierarchy.clear();
-        self.prefix_cache.clear();
-        self.prefix_counts.clear();
-        self.lru_nodes.clear();
-        self.head = None;
-        self.tail = None;
-        self.current_size = 0;
+        self.prefix_cache.write().clear();
+        self.prefix_counts.write().clear();
+        self.hierarchy.write().clear();
         self.memory_usage.store(0, Ordering::Relaxed);
         
         rust_debug_fast!("UnifiedCache::clear() completed for cache '{}', cleared {} entries, {} callbacks", self.name, count, all_callbacks.len());
@@ -1040,12 +1430,17 @@ impl UnifiedCache {
     }
     
     /// Returns the current number of entries in the cache.
-    /// Time complexity: O(1).
+    /// Time complexity: O(shards).
     pub fn len(&self) -> usize {
-        if self.size_callback.is_some() {
-            self.current_size
+        self.shards.iter().map(|s| s.read().data.len()).sum()
+    }
+    
+    /// Returns the total size when size_callback is set, otherwise same as len().
+    pub fn size(&self) -> usize {
+        if self.size_callback.read().is_some() {
+            self.shards.iter().map(|s| s.read().current_size).sum()
         } else {
-            self.data.len()
+            self.len()
         }
     }
     
@@ -1053,7 +1448,8 @@ impl UnifiedCache {
     /// Pure read operation that doesn't modify cache state.
     /// Time complexity: O(1).
     pub(crate) fn contains(&self, key: &Arc<CacheKey>) -> bool {
-        self.data.contains_key(key)
+        let shard_index = self.get_shard_index(key);
+        self.shards[shard_index].read().data.contains_key(key)
     }
     
     /// Returns the maximum capacity of the cache.
@@ -1063,25 +1459,13 @@ impl UnifiedCache {
     }
     
     /// Sets the size callback for calculating entry sizes.
-    pub fn set_size_callback(&mut self, py: Python, callback: Option<Py<PyAny>>) {
-        let has_callback = callback.is_some();
-        self.size_callback = callback;
-        
-        // Recompute current size from existing entries
-        if has_callback {
-            self.current_size = 0;
-            for entry in self.data.values() {
-                let entry_size = self.calculate_size(py, &entry.value).unwrap_or(DEFAULT_ENTRY_SIZE);
-                self.current_size = self.current_size.saturating_add(entry_size);
-            }
-        } else {
-            self.current_size = 0;
-        }
+    pub fn set_size_callback(&self, _py: Python, callback: Option<Py<PyAny>>) {
+        *self.size_callback.write() = callback;
     }
     
-    /// Calculates the size of a value using the size callback.
-    fn calculate_size(&self, py: Python, value: &Py<PyAny>) -> PyResult<usize> {
-        if let Some(ref callback) = self.size_callback {
+    /// Calculates the size of a value using the size callback - call outside locks
+    fn calculate_size_unlocked(&self, py: Python, value: &Py<PyAny>) -> PyResult<usize> {
+        if let Some(ref callback) = *self.size_callback.read() {
             let result = callback.bind(py).call1((value,))?;
             Ok(result.extract()?)
         } else {
@@ -1089,63 +1473,63 @@ impl UnifiedCache {
         }
     }
     
-    /// Checks and repairs cache consistency between data and lru_nodes.
-    /// Returns true if inconsistencies were found and repaired.
-    /// Time complexity: O(n) where n is the number of cache entries.
-    fn check_consistency(&mut self) -> bool {
-        let mut inconsistent = false;
-        
-        // Check that every data entry has a corresponding lru_node
-        let data_keys: Vec<_> = self.data.keys().cloned().collect();
-        for key in &data_keys {
-            if !self.lru_nodes.contains_key(key) {
-                rust_debug_fast!("Consistency error: data key {:?} missing from lru_nodes, reconstructing", key);
-                // Reconstruct missing LRU node instead of dropping data entry
-                let node = Box::new(LruNode { prev: None, next: None });
-                self.lru_nodes.insert(key.clone(), node);
-                inconsistent = true;
-            }
-        }
-        
-        // Check that every lru_node has a corresponding data entry
-        let lru_keys: Vec<_> = self.lru_nodes.keys().cloned().collect();
-        for key in &lru_keys {
-            if !self.data.contains_key(key) {
-                rust_debug_fast!("Consistency error: lru_node key {:?} missing from data", key);
-                // Remove orphaned lru_nodes
-                self.lru_nodes.remove(key);
-                inconsistent = true;
-            }
-        }
-        
-        // If we found inconsistencies, rebuild the LRU chain
-        if inconsistent {
-            rust_debug_fast!("Rebuilding LRU chain due to inconsistencies");
-            self.head = None;
-            self.tail = None;
-            
-            // Rebuild LRU chain for all data entries (now all have nodes)
-            let valid_keys: Vec<_> = self.data.keys().cloned().collect();
-            for key in valid_keys {
-                self.add_to_front(key);
-            }
-        }
-        
-        inconsistent
-    }
+
     
     /// Resizes the cache to a new capacity, evicting entries if necessary.
-    /// Time complexity: O(evicted_entries * k) where k is average tuple length.
     pub fn resize(&mut self, py: Python, new_capacity: usize) -> Vec<Py<PyAny>> {
-        let mut evicted_callbacks = Vec::new();
+        let old_capacity = self.capacity;
         self.capacity = new_capacity;
+        let mut evicted_callbacks = Vec::new();
         
-        // Evict entries if we're over capacity
-        while (if self.size_callback.is_some() { self.current_size } else { self.data.len() }) > new_capacity {
-            if let Some((_, _, callbacks)) = self.popitem(py) {
-                evicted_callbacks.extend(callbacks);
-            } else {
-                break;
+        // If shrinking, evict LRU entries using global eviction list
+        if new_capacity < old_capacity {
+            let use_size_based = self.size_callback.read().is_some();
+            while (if use_size_based { self.size() } else { self.len() }) > new_capacity {
+                let evict_info = {
+                    let mut global_eviction = self.global_eviction.write();
+                    global_eviction.remove_lru()
+                };
+                
+                if let Some((lru_key, shard_idx)) = evict_info {
+                    // Copy value and remove entry under lock
+                    let (entry_data, value_copy) = {
+                        let mut shard = self.shards[shard_idx].write();
+                        if let Some(entry) = shard.data.remove(&lru_key) {
+                            let value_copy = if use_size_based {
+                                Some(entry.value.clone_ref(py))
+                            } else {
+                                None
+                            };
+                            self.remove_from_lru_shard(&mut shard, &lru_key);
+                            (Some((entry.get_callbacks(), entry.prefix_arcs.clone())), value_copy)
+                        } else {
+                            (None, None)
+                        }
+                    };
+                    
+                    if let Some((callbacks, prefix_arcs)) = entry_data {
+                        // Calculate size outside lock if needed
+                        let size = if let Some(value_copy) = value_copy {
+                            self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                        } else {
+                            DEFAULT_ENTRY_SIZE
+                        };
+                        
+                        // Update size tracking
+                        {
+                            let mut shard = self.shards[shard_idx].write();
+                            shard.current_size = shard.current_size.saturating_sub(size);
+                        }
+                        self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                        
+                        evicted_callbacks.extend(callbacks);
+                        if let Some(arcs) = prefix_arcs.as_ref() {
+                            Self::remove_hierarchy_static(&lru_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                        }
+                    }
+                } else {
+                    break;
+                }
             }
         }
         
@@ -1153,70 +1537,120 @@ impl UnifiedCache {
     }
     
     /// Atomic get-or-set operation - returns existing value or sets and returns new value.
-    /// Time complexity: O(1) for HashMap lookup, O(k) for hierarchy if new tuple key.
-    pub fn setdefault(&mut self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    pub fn setdefault(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let shard_index = self.get_shard_index(&cache_key);
         
-        // Atomic check-and-insert using HashMap entry API
-        match self.data.get(&cache_key) {
-            Some(entry) => {
+        // First check if entry exists
+        {
+            let mut shard = self.shards[shard_index].write();
+            if let Some(entry) = shard.data.get(&cache_key) {
                 self.setdefault_hits.fetch_add(1, Ordering::Relaxed);
                 let existing_value = entry.value.clone_ref(py);
-                // Move to front after getting value
-                if !self.move_to_front(&cache_key) {
-                    self.add_to_front(cache_key);
-                }
-                Ok(existing_value)
-            }
-            None => {
-                // Insert directly without calling set() to avoid race
-                let original_key = key.clone().unbind();
-                let mut evicted_callbacks = Vec::new();
-                
-                // Track set operations
-                self.sets.fetch_add(1, Ordering::Relaxed);
-                
-                // Calculate entry size for eviction logic
-                let new_entry_size = if self.size_callback.is_some() {
-                    self.calculate_size(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE)
-                } else {
-                    DEFAULT_ENTRY_SIZE
-                };
-                
-                // Evict LRU entries until we have space
-                while (if self.size_callback.is_some() { self.current_size + new_entry_size } else { self.data.len() + 1 }) > self.capacity {
-                    if let Some((_, _, callbacks)) = self.popitem(py) {
-                        evicted_callbacks.extend(callbacks);
-                    } else {
-                        break;
-                    }
-                }
-                
-                let prefix_arcs = self.add_hierarchy(&cache_key);
-                
-                // Update size tracking
-                if self.size_callback.is_some() {
-                    self.current_size = self.current_size.saturating_add(new_entry_size);
-                    self.memory_usage.fetch_add(new_entry_size as u64, Ordering::Relaxed);
-                }
-                
-                // Create and insert entry
-                let mut entry = CacheEntry::new(value.clone_ref(py), original_key);
-                entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
-                
-                self.data.insert(cache_key.clone(), entry);
-                self.add_to_front(cache_key);
-                
-                // Execute callbacks
-                for callback in evicted_callbacks {
-                    if let Err(e) = callback.bind(py).call0() {
-                        eprintln!("Cache callback error: {}", e);
-                    }
-                }
-                
-                Ok(value)
+                self.move_to_front_shard(&mut shard, &cache_key);
+                return Ok(existing_value);
             }
         }
+        
+        // Entry doesn't exist, prepare for insertion
+        let original_key = key.clone().unbind();
+        let prefix_arcs = Self::add_hierarchy_static(&cache_key, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+        
+        // Calculate size outside lock
+        let entry_size = if self.size_callback.read().is_some() {
+            self.calculate_size_unlocked(py, &value).unwrap_or(DEFAULT_ENTRY_SIZE)
+        } else {
+            DEFAULT_ENTRY_SIZE
+        };
+        
+        // Insert entry
+        let node_id = {
+            let mut shard = self.shards[shard_index].write();
+            
+            // Check if entry was inserted concurrently
+            if let Some(entry) = shard.data.get(&cache_key) {
+                self.setdefault_hits.fetch_add(1, Ordering::Relaxed);
+                let existing_value = entry.value.clone_ref(py);
+                self.move_to_front_shard(&mut shard, &cache_key);
+                return Ok(existing_value);
+            }
+            
+            let mut entry = CacheEntry::new(value.clone_ref(py), original_key);
+            entry.prefix_arcs = if prefix_arcs.is_empty() { None } else { Some(prefix_arcs) };
+            
+            // Update size tracking
+            shard.current_size += entry_size;
+            self.memory_usage.fetch_add(entry_size as u64, Ordering::Relaxed);
+            
+            // Add to global eviction list
+            let node_id = NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            entry.node_id = Some(node_id);
+            
+            shard.data.insert(cache_key.clone(), entry);
+            self.add_to_front_shard(&mut shard, cache_key.clone());
+            
+            node_id
+        };
+        
+        // Add to global eviction outside shard lock
+        {
+            let mut global_eviction = self.global_eviction.write();
+            global_eviction.add_node(node_id, cache_key.clone(), shard_index);
+        }
+        
+        // Capacity enforcement after insertion
+        let use_size_based = self.size_callback.read().is_some();
+        while (if use_size_based { self.size() } else { self.len() }) > self.capacity {
+            let evict_info = {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_lru()
+            };
+            
+            if let Some((lru_key, shard_idx)) = evict_info {
+                // Copy value and remove entry under lock
+                let (entry_data, value_copy) = {
+                    let mut shard = self.shards[shard_idx].write();
+                    if let Some(entry) = shard.data.remove(&lru_key) {
+                        let value_copy = if use_size_based {
+                            Some(entry.value.clone_ref(py))
+                        } else {
+                            None
+                        };
+                        self.remove_from_lru_shard(&mut shard, &lru_key);
+                        self.evictions_size.fetch_add(1, Ordering::Relaxed);
+                        
+                        (Some(entry.prefix_arcs.clone()), value_copy)
+                    } else {
+                        (None, None)
+                    }
+                };
+                
+                if let Some(prefix_arcs) = entry_data {
+                    // Calculate size outside lock
+                    let size = if let Some(value_copy) = value_copy {
+                        self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                    } else {
+                        DEFAULT_ENTRY_SIZE
+                    };
+                    
+                    // Update size tracking
+                    {
+                        let mut shard = self.shards[shard_idx].write();
+                        shard.current_size = shard.current_size.saturating_sub(size);
+                    }
+                    self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                    
+                    if let Some(arcs) = prefix_arcs {
+                        Self::remove_hierarchy_static(&lru_key, &arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        
+        self.sets.fetch_add(1, Ordering::Relaxed);
+        Ok(value)
     }
     
     /// Get cache statistics
@@ -1246,32 +1680,26 @@ impl UnifiedCache {
     }
     
     /// Gets all entries that have the given tuple prefix.
-    /// Returns Vec of (original_key, value) pairs.
-    /// Time complexity: O(children) where children is number of matching entries.
-    pub fn get_prefix_children(&mut self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
+    pub fn get_prefix_children(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
         let cache_key = Arc::new(CacheKey::from_bound(prefix_key)?);
         let mut results = Vec::new();
         
-        // Collect child keys first to avoid borrow checker issues
-        let child_keys: Vec<Arc<CacheKey>> = if let Some(children) = self.hierarchy.get(&cache_key) {
-            children.keys().cloned().collect()
-        } else {
-            Vec::new()
+        // Get children from global hierarchy
+        let child_keys: Vec<_> = {
+            let hierarchy = self.hierarchy.read();
+            if let Some(children) = hierarchy.get(&cache_key) {
+                children.keys().cloned().collect()
+            } else {
+                Vec::new()
+            }
         };
         
-        // Now update LRU and collect results
+        // Get entries from appropriate shards
         for child_key in child_keys {
-            if let Some(entry) = self.data.get(&child_key) {
-                // Clone values before mutable operations
-                let original_key = entry.original_key.clone_ref(py);
-                let value = entry.value.clone_ref(py);
-                
-                // Update LRU position for accessed entries
-                if !self.move_to_front(&child_key) {
-                    self.add_to_front(child_key.clone());
-                }
-                
-                results.push((original_key, value));
+            let shard_index = self.get_shard_index(&child_key);
+            let shard = self.shards[shard_index].read();
+            if let Some(entry) = shard.data.get(&child_key) {
+                results.push((entry.original_key.clone_ref(py), entry.value.clone_ref(py)));
             }
         }
         
@@ -1295,44 +1723,48 @@ pub struct AsyncRustLruCache {
 impl RustCacheNode {
     #[getter]
     fn key(&self, py: Python) -> PyResult<Py<PyAny>> {
-        match self.key.as_ref() {
-            CacheKey::String(s) => Ok(PyString::new(py, s).into()),
-            CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
-            CacheKey::IntBig(bi) => {
-                let s = bi.to_string();
-                Ok(PyString::new(py, &s).into())
-            },
-            CacheKey::None => Ok(py.None()),
-            CacheKey::Tuple(parts) => {
-                let py_parts: PyResult<Vec<_>> = parts.iter()
-                    .map(|part| {
-                        match part {
-                            CacheKey::String(s) => Ok(PyString::new(py, s).into()),
-                            CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
-                            CacheKey::None => Ok(py.None()),
-                            _ => Ok(PyString::new(py, &format!("{:?}", part)).into())
-                        }
-                    })
-                    .collect();
-                let tuple = PyTuple::new(py, py_parts?)?;
-                Ok(tuple.into())
-            },
-            CacheKey::Hashed { type_name, py_hash, obj_id } => {
-                Ok(PyString::new(py, &format!("{}#{}@{}", type_name, py_hash, obj_id)).into())
+        fn reconstruct_key(key: &CacheKey, py: Python) -> PyResult<Py<PyAny>> {
+            match key {
+                CacheKey::String(s) => Ok(PyString::new(py, s).into()),
+                CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
+                CacheKey::IntBig(bi) => {
+                    let s = bi.to_string();
+                    if let Ok(i) = s.parse::<i64>() {
+                        Ok(PyInt::new(py, i).into())
+                    } else {
+                        // Create PyLong directly from decimal string
+                        let py_long = py.import("builtins")?.getattr("int")?.call1((&s,))?;
+                        Ok(py_long.unbind())
+                    }
+                },
+                CacheKey::None => Ok(py.None()),
+                CacheKey::Tuple(parts) => {
+                    let py_parts: PyResult<Vec<_>> = parts.iter()
+                        .map(|part| reconstruct_key(part, py))
+                        .collect();
+                    let tuple = PyTuple::new(py, py_parts?)?;
+                    Ok(tuple.into())
+                },
+                CacheKey::Hashed { type_name, py_hash, obj_id } => {
+                    Ok(PyString::new(py, &format!("{}#{}@{}", type_name, py_hash, obj_id)).into())
+                }
             }
         }
+        reconstruct_key(&self.key, py)
     }
     
     #[getter]
     fn value(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         if let Some(cache_arc) = self.cache.upgrade() {
             let cache = cache_arc.read();
-            match cache.get_by_key(&self.key) {
+            let shard_index = cache.get_shard_index(&self.key);
+            let shard = cache.shards[shard_index].read();
+            match shard.data.get(&self.key) {
                 Some(entry) => Ok(Some(entry.value.clone_ref(py))),
                 None => Ok(None)
             }
         } else {
-            Ok(None) // Cache has been dropped
+            Ok(None)
         }
     }
     
@@ -1405,7 +1837,7 @@ impl RustCacheNode {
     fn drop_from_cache(&mut self, py: Python) -> PyResult<bool> {
         if let Some(cache_arc) = self.cache.upgrade() {
             let (found, callbacks) = {
-                let mut cache = cache_arc.write();
+                let cache = cache_arc.read();
                 cache.invalidate_by_key(py, &self.key)?
             };
             
@@ -1445,10 +1877,17 @@ impl RustCacheNode {
         self.last_access_time.store(now, Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
         
-        // Update LRU position in cache
+        // Update LRU position in cache and global eviction list
         if let Some(cache_arc) = self.cache.upgrade() {
-            let mut cache = cache_arc.write();
-            cache.touch_key(&self.key);
+            let cache = cache_arc.read();
+            let shard_index = cache.get_shard_index(&self.key);
+            let mut shard = cache.shards[shard_index].write();
+            cache.move_to_front_shard(&mut shard, &self.key);
+            drop(shard);
+            
+            // Also move in global eviction list
+            let mut global_eviction = cache.global_eviction.write();
+            global_eviction.move_to_front(self.node_id);
         }
     }
     
@@ -1502,13 +1941,15 @@ impl RustCacheNode {
     fn calculate_value_size(&self, py: Python) -> PyResult<usize> {
         if let Some(cache_arc) = self.cache.upgrade() {
             let cache = cache_arc.read();
-            if let Some(entry) = cache.get_by_key(&self.key) {
-                cache.calculate_size(py, &entry.value)
+            let shard_index = cache.get_shard_index(&self.key);
+            let shard = cache.shards[shard_index].read();
+            if let Some(entry) = shard.data.get(&self.key) {
+                cache.calculate_size_unlocked(py, &entry.value)
             } else {
-                Ok(DEFAULT_ENTRY_SIZE) // Default size if entry not found
+                Ok(DEFAULT_ENTRY_SIZE)
             }
         } else {
-            Ok(DEFAULT_ENTRY_SIZE) // Cache has been dropped
+            Ok(DEFAULT_ENTRY_SIZE)
         }
     }
     
@@ -1525,7 +1966,7 @@ impl RustCacheNode {
             let cache = cache_arc.read();
             cache.contains(&self.key)
         } else {
-            false // Cache has been dropped
+            false
         }
     }
     
@@ -1542,52 +1983,27 @@ impl RustCacheNode {
         }
     }
     
-    /// Add to global eviction list (for time-based eviction)
-    fn add_to_global_list(&mut self, prev_id: Option<u64>, next_id: Option<u64>) {
-        self.prev_node = prev_id;
-        self.next_node = next_id;
-        self.in_global_list = true;
-    }
-    
-    /// Remove from global eviction list
-    fn remove_from_global_list(&mut self) -> (Option<u64>, Option<u64>) {
-        let prev = self.prev_node;
-        let next = self.next_node;
-        self.prev_node = None;
-        self.next_node = None;
-        self.in_global_list = false;
-        (prev, next)
-    }
-    
-    /// Move to front of global eviction list
-    fn move_to_front_global(&mut self, new_next: Option<u64>) {
-        self.prev_node = None;
-        self.next_node = new_next;
-    }
-    
-    /// Check if node is in global eviction list
-    fn is_in_global_list(&self) -> bool {
-        self.in_global_list
-    }
+
     
     /// Compare current value with new value (for change detection)
     fn value_changed(&self, py: Python, new_value: Py<PyAny>) -> PyResult<bool> {
         if let Some(cache_arc) = self.cache.upgrade() {
             let cache = cache_arc.read();
-            if let Some(entry) = cache.get_by_key(&self.key) {
+            let shard_index = cache.get_shard_index(&self.key);
+            let shard = cache.shards[shard_index].read();
+            if let Some(entry) = shard.data.get(&self.key) {
                 match entry.value.bind(py).eq(&new_value.bind(py)) {
                     Ok(is_equal) => Ok(!is_equal),
                     Err(e) => {
-                        // If comparison fails, assume it's a change to be safe
                         eprintln!("Warning: Failed to compare values in cache: {}", e);
                         Ok(true)
                     }
                 }
             } else {
-                Ok(true) // No current value, so it's a change
+                Ok(true)
             }
         } else {
-            Ok(true) // Cache has been dropped, consider it a change
+            Ok(true)
         }
     }
     
@@ -1595,15 +2011,60 @@ impl RustCacheNode {
     fn set_value_if_changed(&mut self, py: Python, new_value: Py<PyAny>) -> PyResult<bool> {
         let changed = self.value_changed(py, new_value.clone_ref(py))?;
         if changed {
-            // Update cache value
             if let Some(cache_arc) = self.cache.upgrade() {
-                let mut cache = cache_arc.write();
-                if let Some(entry) = cache.data.get_mut(&self.key) {
-                    entry.value = new_value;
-                    entry.run_and_clear_callbacks(py);
+                let cache = cache_arc.read();
+                let shard_index = cache.get_shard_index(&self.key);
+                
+                // Get old value and callbacks outside lock
+                let (old_value, entry_callbacks) = {
+                    let shard = cache.shards[shard_index].read();
+                    if let Some(entry) = shard.data.get(&self.key) {
+                        (Some(entry.value.clone_ref(py)), entry.get_callbacks())
+                    } else {
+                        (None, Vec::new())
+                    }
+                };
+                
+                // Calculate size difference outside lock
+                let size_diff = if let (Some(old_val), Some(ref size_callback)) = (&old_value, cache.size_callback.read().as_ref()) {
+                    let old_size = size_callback.bind(py).call1((old_val.bind(py),))
+                        .and_then(|r| r.extract::<usize>())
+                        .unwrap_or(DEFAULT_ENTRY_SIZE);
+                    let new_size = size_callback.bind(py).call1((new_value.bind(py),))
+                        .and_then(|r| r.extract::<usize>())
+                        .unwrap_or(DEFAULT_ENTRY_SIZE);
+                    Some(new_size as i64 - old_size as i64)
+                } else {
+                    None
+                };
+                
+                // Update entry under lock
+                {
+                    let mut shard = cache.shards[shard_index].write();
+                    if let Some(entry) = shard.data.get_mut(&self.key) {
+                        entry.value = new_value;
+                        entry.callbacks = None; // Clear callbacks
+                        
+                        // Update size tracking
+                        if let Some(diff) = size_diff {
+                            if diff > 0 {
+                                shard.current_size += diff as usize;
+                                cache.memory_usage.fetch_add(diff as u64, Ordering::Relaxed);
+                            } else if diff < 0 {
+                                shard.current_size = shard.current_size.saturating_sub((-diff) as usize);
+                                cache.memory_usage.fetch_sub((-diff) as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                
+                // Execute callbacks outside lock
+                for callback in entry_callbacks {
+                    if let Err(e) = callback.bind(py).call0() {
+                        eprintln!("Cache callback error: {}", e);
+                    }
                 }
             }
-            // Run node callbacks
             self.run_and_clear_callbacks(py);
         }
         Ok(changed)
@@ -1616,17 +2077,7 @@ impl RustCacheNode {
         self.access_count.fetch_add(1, Ordering::Relaxed);
     }
     
-    /// Remove from global eviction system
-    fn remove_from_global_eviction(&mut self) -> bool {
-        if self.in_global_list {
-            self.in_global_list = false;
-            self.prev_node = None;
-            self.next_node = None;
-            true
-        } else {
-            false
-        }
-    }
+
     
 
 }
@@ -1636,20 +2087,21 @@ impl RustLruCache {
     /// Creates a new thread-safe Rust LRU cache with the specified configuration.
     /// Wraps UnifiedCache in Arc<Mutex<>> for safe concurrent access from Python.
     #[new]
-    #[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None, size_callback=None))]
+    #[pyo3(signature = (max_size, cache_name=None, metrics=None, callback_policy=None, size_callback=None, shard_count=None))]
     fn new(
         max_size: usize, 
         cache_name: Option<String>, 
         metrics: Option<Py<PyAny>>,
         callback_policy: Option<String>,
-        size_callback: Option<Py<PyAny>>
+        size_callback: Option<Py<PyAny>>,
+        shard_count: Option<usize>
     ) -> Self {
         let name = cache_name.unwrap_or_else(|| "rust_cache".to_string());
         let policy = match callback_policy.as_deref() {
             Some("append") => CallbackPolicy::Append,
             _ => CallbackPolicy::Replace,
         };
-        let cache = Arc::new(RwLock::new(UnifiedCache::new(name.clone(), max_size, metrics, policy)));
+        let cache = Arc::new(RwLock::new(UnifiedCache::new_with_shards(name.clone(), max_size, metrics, policy, shard_count)));
         
         // Set size callback if provided
         if let Some(callback) = size_callback {
@@ -1671,7 +2123,7 @@ impl RustLruCache {
     /// Thread-safe wrapper around UnifiedCache::get with mutex locking.
     #[pyo3(signature = (key, default=None, callbacks=None))]
     fn get(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<Py<PyAny>> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         match cache.get(py, key, callbacks, true, true)? {
             Some(value) => Ok(value),
             None => Ok(default.unwrap_or_else(|| py.None()))
@@ -1684,13 +2136,15 @@ impl RustLruCache {
         let callbacks = callbacks.unwrap_or_default();
         
         let (evicted_callbacks, needs_node) = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             let result = cache.set(py, key, value, callbacks)?;
             
             // Check if we need to create a node
             let needs_node = if cache.enable_nodes {
                 let cache_key = Arc::new(CacheKey::from_bound(key)?);
-                cache.data.get(&cache_key)
+                let shard_index = cache.get_shard_index(&cache_key);
+                let shard = cache.shards[shard_index].read();
+                shard.data.get(&cache_key)
                     .map(|entry| entry.node.is_none())
                     .unwrap_or(false)
             } else {
@@ -1707,12 +2161,17 @@ impl RustLruCache {
             // Create the node first
             let node = {
                 let cache = self.cache.read();
-                cache.create_eviction_node(&self.cache, py, &cache_key, &[])
+                let shard_index = cache.get_shard_index(&cache_key);
+                let shard = cache.shards[shard_index].read();
+                let existing_node_id = shard.data.get(&cache_key).and_then(|e| e.node_id);
+                cache.create_eviction_node(&self.cache, py, &cache_key, &[], existing_node_id)
             }?;
             
             // Then update the entry - re-check existence after concurrent removal
-            let mut cache = self.cache.write();
-            if let Some(entry) = cache.data.get_mut(&cache_key) {
+            let cache = self.cache.write();
+            let shard_index = cache.get_shard_index(&cache_key);
+            let mut shard = cache.shards[shard_index].write();
+            if let Some(entry) = shard.data.get_mut(&cache_key) {
                 if entry.node.is_none() {
                     entry.node = Some(node);
                 }
@@ -1734,7 +2193,7 @@ impl RustLruCache {
     /// Thread-safe with callback execution outside the mutex lock.
     fn invalidate(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<()> {
         let (_, callbacks) = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             cache.invalidate(py, key)?
         };
         
@@ -1753,7 +2212,7 @@ impl RustLruCache {
         let cache_key = Arc::new(CacheKey::from_bound(prefix_key)?);
         let mut all_callbacks = Vec::new();
         let count = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             let removed_entries = cache.invalidate_prefix(py, &cache_key);
             let entry_count = removed_entries.len();
             
@@ -1777,7 +2236,7 @@ impl RustLruCache {
     /// Executes callbacks associated with the removed entry.
     fn pop(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         let (value, callbacks) = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             cache.pop(py, key, default)?
         };
         
@@ -1794,7 +2253,7 @@ impl RustLruCache {
     /// Returns the number of entries that were removed.
     fn clear(&self, py: Python) -> PyResult<usize> {
         let (len, callbacks) = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             cache.clear(py)
         };
         
@@ -1823,7 +2282,7 @@ impl RustLruCache {
     /// Executes callbacks and raises KeyError if cache is empty.
     fn popitem(&self, py: Python) -> PyResult<Py<PyAny>> {
         let result = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             cache.popitem(py)
         };
 
@@ -1850,14 +2309,16 @@ impl RustLruCache {
         }
     }
     
-    /// Python len() support - returns current number of cache entries.
+    /// Python len() support - returns total size when size_callback is set, otherwise entry count.
+    /// NOTE: This diverges from standard dict semantics where len() always returns count.
+    /// When size_callback is set:
+    ///   - len(cache) returns total size (sum of all entry sizes)
+    ///   - Use cache.len() method to get actual entry count
+    /// When no size_callback:
+    ///   - len(cache) returns entry count (standard dict behavior)
     fn __len__(&self) -> PyResult<usize> {
         let cache = self.cache.read();
-        Ok(if cache.size_callback.is_some() {
-            cache.current_size
-        } else {
-            cache.data.len()
-        })
+        Ok(if cache.size_callback.read().is_some() { cache.size() } else { cache.len() })
     }
     
     /// Python 'in' operator support - checks if key exists in cache.
@@ -1868,7 +2329,7 @@ impl RustLruCache {
     
     /// Python dict[key] support - returns value or raises KeyError.
     fn __getitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         match cache.get(py, key, None, true, true)? {
             Some(value) => Ok(value),
             None => Err(pyo3::exceptions::PyKeyError::new_err("Key not found"))
@@ -1883,7 +2344,7 @@ impl RustLruCache {
     /// Python del dict[key] support - removes entry or raises KeyError.
     fn __delitem__(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<()> {
         let (found, callbacks) = {
-            let mut cache = self.cache.write();
+            let cache = self.cache.read();
             cache.invalidate(py, key)?
         };
         
@@ -1917,7 +2378,7 @@ impl RustLruCache {
     
     /// Gets all entries that have the given tuple prefix.
     fn get_prefix_children(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<Vec<(Py<PyAny>, Py<PyAny>)>> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         cache.get_prefix_children(py, prefix_key)
     }
     
@@ -1929,14 +2390,14 @@ impl RustLruCache {
     
     /// Sets the size callback for calculating entry sizes.
     fn set_size_callback(&self, py: Python, callback: Option<Py<PyAny>>) -> PyResult<()> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         cache.set_size_callback(py, callback);
         Ok(())
     }
     
     /// Atomic get-or-set operation
     fn setdefault(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         cache.setdefault(py, key, value)
     }
     
@@ -1953,38 +2414,52 @@ impl RustLruCache {
     /// Get cache statistics for debugging
     fn get_stats(&self) -> PyResult<(usize, usize)> {
         let cache = self.cache.read();
-        Ok((cache.data.len(), cache.capacity))
+        let total_entries: usize = cache.shards.iter().map(|s| s.read().data.len()).sum();
+        Ok((total_entries, cache.capacity))
+    }
+    
+    /// Get actual entry count (always returns count, never size)
+    fn len(&self) -> PyResult<usize> {
+        let cache = self.cache.read();
+        Ok(cache.len())
+    }
+    
+    /// Get total size (returns size when size_callback is set, otherwise same as len)
+    fn size(&self) -> PyResult<usize> {
+        let cache = self.cache.read();
+        Ok(cache.size())
     }
     
     /// Check if cache is empty
     fn is_empty(&self) -> PyResult<bool> {
-        Ok(self.cache.read().data.is_empty())
+        let cache = self.cache.read();
+        Ok(cache.shards.iter().all(|s| s.read().data.is_empty()))
     }
     
-    /// Get estimated memory usage in bytes (matches original LruCache behavior)
+    /// Get estimated memory usage in bytes (upper-bound approximation).
+    /// Includes container capacity overhead and may overcount actual residency.
+    /// Use as a rough estimate, not exact memory footprint.
     fn get_memory_usage(&self) -> PyResult<usize> {
         let cache = self.cache.read();
         let mut total = 0;
         
-        // Cache structure overhead
-        total += cache.data.capacity() * std::mem::size_of::<(Arc<CacheKey>, CacheEntry)>();
-        total += cache.lru_nodes.capacity() * std::mem::size_of::<(Arc<CacheKey>, Box<LruNode>)>();
-        
-        // Per-entry memory usage
-        for (key, entry) in &cache.data {
-            total += key.memory_size();
-            total += entry.memory_size();
+        for shard_lock in &cache.shards {
+            let shard = shard_lock.read();
+            total += shard.data.capacity() * std::mem::size_of::<(Arc<CacheKey>, CacheEntry)>();
+            total += shard.lru_nodes.capacity() * std::mem::size_of::<(Arc<CacheKey>, Box<LruNode>)>();
+            
+            for (key, entry) in &shard.data {
+                total += key.memory_size();
+                total += entry.memory_size();
+            }
         }
-        
-        // LRU node overhead
-        total += cache.lru_nodes.len() * std::mem::size_of::<LruNode>();
         
         Ok(total)
     }
     
     /// Enhanced get with update_metrics and update_last_access parameters
     fn get_advanced(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>, callbacks: Option<Vec<Py<PyAny>>>, _update_metrics: Option<bool>, _update_last_access: Option<bool>) -> PyResult<Py<PyAny>> {
-        let mut cache = self.cache.write();
+        let cache = self.cache.read();
         let cb_list = callbacks.unwrap_or_default();
         
         let update_metrics = _update_metrics.unwrap_or(true);
@@ -2002,18 +2477,26 @@ impl RustLruCache {
         Ok(())
     }
     
-    /// Get all active cache nodes for global eviction
+    /// Get all active cache nodes for global eviction (existing objects only)
     fn get_all_nodes(&self) -> PyResult<Vec<Py<RustCacheNode>>> {
         let cache = self.cache.read();
         Ok(cache.get_all_nodes())
+    }
+    
+    /// Get all cache entries as nodes, creating node objects on demand
+    fn get_all_nodes_complete(&self) -> PyResult<Vec<Py<RustCacheNode>>> {
+        let cache = self.cache.read();
+        Ok(cache.get_all_nodes_complete(&self.cache))
     }
     
     /// Get node for key from cache (for global eviction integration)
     fn get_node_for_key(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<Option<Py<RustCacheNode>>> {
         let cache_key = Arc::new(CacheKey::from_bound(key)?);
         let cache = self.cache.read();
+        let shard_index = cache.get_shard_index(&cache_key);
+        let shard = cache.shards[shard_index].read();
         
-        Ok(cache.data.get(&cache_key)
+        Ok(shard.data.get(&cache_key)
             .and_then(|entry| entry.node.as_ref())
             .map(|node| node.clone_ref(py)))
     }
@@ -2073,7 +2556,7 @@ impl AsyncRustLruCache {
             _ => CallbackPolicy::Replace,
         };
         rust_debug_fast!("Creating AsyncMutex<UnifiedCache>");
-        let cache = Arc::new(AsyncRwLock::new(UnifiedCache::new(name.clone(), max_size, metrics, policy)));
+        let cache = Arc::new(AsyncRwLock::new(UnifiedCache::new_with_shards(name.clone(), max_size, metrics, policy, None)));
         rust_debug_fast!("AsyncRustLruCache created successfully");
         
         Self { cache, name }
@@ -2089,7 +2572,7 @@ impl AsyncRustLruCache {
         let cache = self.cache.clone();
         let key = key.clone().unbind();
         let result = pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut cache = cache.write().await;
+            let cache = cache.read().await;
             Python::with_gil(|py| {
                 let key_bound = key.bind(py);
                 match cache.get(py, &key_bound, None, true, true)? {
@@ -2108,7 +2591,7 @@ impl AsyncRustLruCache {
         let result = pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let callbacks = callbacks.unwrap_or_default();
             let evicted_callbacks = {
-                let mut cache = cache.write().await;
+                let cache = cache.read().await;
                 Python::with_gil(|py| {
                     let key_bound = key.bind(py);
                     cache.set(py, &key_bound, value, callbacks)
@@ -2133,7 +2616,7 @@ impl AsyncRustLruCache {
         let key = key.clone().unbind();
         let result = pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (_, callbacks) = {
-                let mut cache = cache.write().await;
+                let cache = cache.read().await;
                 Python::with_gil(|py| {
                     let key_bound = key.bind(py);
                     cache.invalidate(py, &key_bound)
@@ -2157,7 +2640,7 @@ impl AsyncRustLruCache {
         let cache = self.cache.clone();
         let result = pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (len, callbacks) = {
-                let mut cache = cache.write().await;
+                let cache = cache.read().await;
                 Python::with_gil(|py| cache.clear(py))
             };
             
@@ -2178,7 +2661,7 @@ impl AsyncRustLruCache {
         let mut delay_ms = INITIAL_RETRY_DELAY_MS;
         for attempt in 0..ASYNC_RETRY_ATTEMPTS {
             match self.cache.try_write() {
-                Ok(mut cache) => {
+                Ok(cache) => {
                     rust_debug_fast!("AsyncRustLruCache::clear_sync() - acquired lock on attempt {}", attempt + 1);
                     let (len, callbacks) = cache.clear(py);
                     for callback in callbacks {
@@ -2213,7 +2696,7 @@ pub fn create_rust_lru_cache(
     callback_policy: Option<String>,
     size_callback: Option<Py<PyAny>>
 ) -> PyResult<RustLruCache> {
-    Ok(RustLruCache::new(max_size, cache_name, metrics, callback_policy, size_callback))
+    Ok(RustLruCache::new(max_size, cache_name, metrics, callback_policy, size_callback, None))
 }
 
 #[pyfunction]
