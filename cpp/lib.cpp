@@ -55,124 +55,1261 @@ static bool leak_warnings_enabled = []()
     const char *env = std::getenv("SYNAPSE_RUST_CRYPTO_LEAK_WARNINGS");
     return env && std::string(env) == "1";
 }();
-// This version uses recursion currently not advised for very deep structures and production usage
-static nb::object normalize_for_canonical_json(nb::handle obj)
+
+// Helpers from earlier (unchanged)
+struct NormLimits
 {
-    // Null
-    if (obj.is_none())
-        return nb::object(obj, nb::detail::borrow_t{});
+    Py_ssize_t max_container_len = -1;
+    Py_ssize_t max_string_bytes = -1;
+    Py_ssize_t max_nodes = -1;
+};
 
-    // Fast path for native JSON scalars
-    if (nb::isinstance<nb::str>(obj) ||
-        nb::isinstance<nb::bool_>(obj) ||
-        nb::isinstance<nb::int_>(obj) ||
-        nb::isinstance<nb::float_>(obj))
+static inline void check_len(Py_ssize_t len, Py_ssize_t limit, const char *what)
+{
+    if (limit >= 0 && len > limit)
     {
-        // Note: floats must be finite; let encoder reject NaN/Inf if present
-        return nb::object(obj, nb::detail::borrow_t{});
+        std::string msg = std::string(what) + " length exceeds limit";
+        throw nb::value_error(msg.c_str());
     }
+}
 
-    // Native list -> list (recursive normalize)
-    if (nb::isinstance<nb::list>(obj))
+static inline void check_nodes(Py_ssize_t &counter, Py_ssize_t limit)
+{
+    if (limit >= 0)
     {
-        nb::list in = nb::cast<nb::list>(obj);
-        nb::list out;
-        for (nb::handle v : in)
-            out.append(normalize_for_canonical_json(v));
-        return out;
-    }
-
-    // tuple -> list
-    if (nb::isinstance<nb::tuple>(obj))
-    {
-        nb::tuple t = nb::cast<nb::tuple>(obj);
-        nb::list out;
-        for (size_t i = 0; i < t.size(); ++i)
-            out.append(normalize_for_canonical_json(t[i]));
-        return out;
-    }
-
-    // generic sequence -> list
-    // MINIMAL FIX: exclude mappings/dicts/strings/bytes so they can’t become lists of keys
-    if (PySequence_Check(obj.ptr()) &&
-        !PyMapping_Check(obj.ptr()) &&
-        !PyDict_Check(obj.ptr()) &&
-        !nb::isinstance<nb::str>(obj) &&
-        !PyBytes_Check(obj.ptr()))
-    {
-        PyObject *seq_raw = PySequence_Fast(obj.ptr(), "expected a sequence");
-        if (!seq_raw)
-            throw nb::python_error();
-        nb::object seq_obj(nb::handle(seq_raw), nb::detail::steal_t{});
-        nb::list out;
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(seq_raw);
-        PyObject **items = PySequence_Fast_ITEMS(seq_raw);
-        for (Py_ssize_t i = 0; i < n; ++i)
-            out.append(normalize_for_canonical_json(nb::handle(items[i])));
-        return out;
-    }
-
-    // dict -> dict with normalized values; enforce string keys
-    if (nb::isinstance<nb::dict>(obj))
-    {
-        nb::dict in = nb::cast<nb::dict>(obj);
-        nb::dict out;
-        for (auto item : in)
+        if (++counter > limit)
         {
-            nb::str k = nb::str(item.first); // enforce JSON string key
-            out[k] = normalize_for_canonical_json(item.second);
+            throw nb::value_error("normalization node budget exceeded");
         }
-        return out;
     }
+}
 
-    // Mapping (immutabledict/frozendict/etc.) -> dict
-    if (PyMapping_Check(obj.ptr()))
+static inline Py_ssize_t utf8_len_bytes(PyObject *py_str)
+{
+    Py_ssize_t size = 0;
+    const char *data = PyUnicode_AsUTF8AndSize(py_str, &size);
+    if (!data)
+        throw nb::python_error();
+    return size;
+}
+
+static inline bool is_scalar_fast(nb::handle o, const NormLimits &lim)
+{
+    PyObject *p = o.ptr();
+    if (p == Py_None)
+        return true;
+    if (PyBool_Check(p))
+        return true;
+    if (PyLong_Check(p))
+        return true;
+    if (PyFloat_Check(p))
+        return true;
+    if (PyUnicode_Check(p))
     {
-        PyObject *items_raw = PyMapping_Items(obj.ptr()); // new ref: list[(k,v)]
+        if (lim.max_string_bytes >= 0)
+        {
+            Py_ssize_t blen = utf8_len_bytes(p);
+            check_len(blen, lim.max_string_bytes, "string");
+        }
+        return true;
+    }
+    return false;
+}
+
+static nb::object normalize_for_canonical_json_with_limits(nb::handle root, const NormLimits &lim)
+{
+    if (is_scalar_fast(root, lim))
+        return nb::object(root, nb::detail::borrow_t{});
+
+    struct Frame
+    {
+        enum Kind
+        {
+            ListK,
+            TupleK,
+            SeqK,
+            DictK,
+            MapK,
+            SetK
+        } kind;
+        nb::object in, out;
+        Py_ssize_t i = 0, n = 0;
+        PyObject *seq_raw = nullptr;
+        PyObject **seq_items = nullptr;
+        PyObject *iter = nullptr;
+        nb::list map_items;
+        nb::object pending_key;
+        bool waiting_child = false;
+    };
+
+    Py_ssize_t nodes = 0;
+    std::vector<Frame> stack;
+    stack.reserve(32);
+
+    auto push_list = [&](nb::object in_list)
+    {
+        Frame f;
+        f.kind = Frame::ListK;
+        f.in = in_list;
+        f.n = PyList_GET_SIZE(in_list.ptr());
+        check_len(f.n, lim.max_container_len, "list");
+        check_nodes(nodes, lim.max_nodes);
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_tuple = [&](nb::object in_tuple)
+    {
+        Frame f;
+        f.kind = Frame::TupleK;
+        f.in = in_tuple;
+        f.n = PyTuple_GET_SIZE(in_tuple.ptr());
+        check_len(f.n, lim.max_container_len, "tuple");
+        check_nodes(nodes, lim.max_nodes);
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_seq = [&](nb::handle in_seq)
+    {
+        Frame f;
+        f.kind = Frame::SeqK;
+        f.in = nb::object(in_seq, nb::detail::borrow_t{});
+        f.seq_raw = PySequence_Fast(in_seq.ptr(), "expected a sequence");
+        if (!f.seq_raw)
+            throw nb::python_error();
+        f.n = PySequence_Fast_GET_SIZE(f.seq_raw);
+        check_len(f.n, lim.max_container_len, "sequence");
+        check_nodes(nodes, lim.max_nodes);
+        f.seq_items = PySequence_Fast_ITEMS(f.seq_raw);
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_dict = [&](nb::object in_dict)
+    {
+        Frame f;
+        f.kind = Frame::DictK;
+        f.in = in_dict;
+        nb::object keys_obj = in_dict.attr("keys")();
+        f.seq_raw = PySequence_Fast(keys_obj.ptr(), "expected a sequence");
+        if (!f.seq_raw)
+            throw nb::python_error();
+        f.n = PySequence_Fast_GET_SIZE(f.seq_raw);
+        check_len(f.n, lim.max_container_len, "dict");
+        check_nodes(nodes, lim.max_nodes);
+        f.seq_items = PySequence_Fast_ITEMS(f.seq_raw);
+        f.out = nb::dict();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_map = [&](nb::handle in_map)
+    {
+        Frame f;
+        f.kind = Frame::MapK;
+        f.in = nb::object(in_map, nb::detail::borrow_t{});
+        PyObject *items_raw = PyMapping_Items(in_map.ptr());
         if (!items_raw)
             throw nb::python_error();
         nb::object items_obj(nb::handle(items_raw), nb::detail::steal_t{});
-        nb::list seq = nb::cast<nb::list>(items_obj);
-        nb::dict out;
-        for (nb::handle kvh : seq)
-        {
-            nb::tuple kv = nb::cast<nb::tuple>(kvh);
-            nb::str k = nb::str(kv[0]); // enforce JSON string key
-            out[k] = normalize_for_canonical_json(kv[1]);
-        }
-        return out;
-    }
+        f.map_items = nb::cast<nb::list>(items_obj);
+        f.n = PyList_GET_SIZE(f.map_items.ptr());
+        check_len(f.n, lim.max_container_len, "mapping");
+        check_nodes(nodes, lim.max_nodes);
+        f.out = nb::dict();
+        stack.push_back(std::move(f));
+    };
 
-    // Set/frozenset -> list
-    if (PySet_Check(obj.ptr()) || PyFrozenSet_Check(obj.ptr()))
+    auto push_set = [&](nb::handle in_set)
     {
-        nb::list out;
-        PyObject *it = PyObject_GetIter(obj.ptr());
-        if (!it)
+        Frame f;
+        f.kind = Frame::SetK;
+        f.in = nb::object(in_set, nb::detail::borrow_t{});
+        Py_ssize_t sz = PyObject_Size(in_set.ptr());
+        if (sz < 0)
             throw nb::python_error();
-        nb::object it_obj(nb::handle(it), nb::detail::steal_t{});
-        for (;;)
-        {
-            PyObject *nxt = PyIter_Next(it);
-            if (!nxt)
-            {
-                if (PyErr_Occurred())
-                    throw nb::python_error();
-                break;
-            }
-            nb::object elem(nb::handle(nxt), nb::detail::steal_t{});
-            out.append(normalize_for_canonical_json(elem));
-        }
-        return out;
+        check_len(sz, lim.max_container_len, "set");
+        check_nodes(nodes, lim.max_nodes);
+        f.iter = PyObject_GetIter(in_set.ptr());
+        if (!f.iter)
+            throw nb::python_error();
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    // Initial classification (mirror recursive ordering)
+    if (PyList_Check(root.ptr()))
+    {
+        push_list(nb::cast<nb::list>(root));
+    }
+    else if (PyTuple_Check(root.ptr()))
+    {
+        push_tuple(nb::cast<nb::tuple>(root));
+    }
+    else if (PySequence_Check(root.ptr()) &&
+             !PyMapping_Check(root.ptr()) &&
+             !PyDict_Check(root.ptr()) &&
+             !PyUnicode_Check(root.ptr()) &&
+             !PyBytes_Check(root.ptr()) &&
+             !PyByteArray_Check(root.ptr()))
+    {
+        push_seq(root);
+    }
+    else if (PyDict_Check(root.ptr()))
+    {
+        push_dict(nb::cast<nb::dict>(root));
+    }
+    else if (PyMapping_Check(root.ptr()))
+    {
+        push_map(root);
+    }
+    else if (PySet_Check(root.ptr()) || PyFrozenSet_Check(root.ptr()))
+    {
+        push_set(root);
+    }
+    else if (PyBytes_Check(root.ptr()) || PyByteArray_Check(root.ptr()))
+    {
+        throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+    }
+    else
+    {
+        std::string msg = "object type is not JSON-serialisable: ";
+        msg += Py_TYPE(root.ptr())->tp_name;
+        throw nb::type_error(msg.c_str());
     }
 
-    // Bytes/bytearray: reject (policy can be added if needed)
-    if (PyBytes_Check(obj.ptr()))
-        throw nb::type_error("bytes are not JSON-serialisable");
-    if (PyByteArray_Check(obj.ptr()))
-        throw nb::type_error("bytearray is not JSON-serialisable");
+    auto attach_done_to_parent = [&](const nb::object &done)
+    {
+        Frame &parent = stack.back();
+        switch (parent.kind)
+        {
+        case Frame::ListK:
+        case Frame::TupleK:
+        case Frame::SeqK:
+        case Frame::SetK:
+        {
+            nb::list out = nb::cast<nb::list>(parent.out);
+            out.append(done);
+            break;
+        }
+        case Frame::DictK:
+        case Frame::MapK:
+        {
+            if (!parent.waiting_child)
+            {
+                throw nb::type_error("internal error: mapping parent not waiting for child");
+            }
+            nb::dict out = nb::cast<nb::dict>(parent.out);
+            out[parent.pending_key] = done;
+            parent.pending_key = nb::object();
+            parent.waiting_child = false;
+            break;
+        }
+        }
+    };
 
-    // Unknown: reject
+    while (!stack.empty())
+    {
+        Frame &f = stack.back();
+
+        if (f.kind == Frame::ListK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle child(PyList_GET_ITEM(f.in.ptr(), f.i));
+                f.i++;
+                if (is_scalar_fast(child, lim))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+                if (PyList_Check(child.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (PyTuple_Check(child.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !PyUnicode_Check(child.ptr()) &&
+                    !PyBytes_Check(child.ptr()) &&
+                    !PyByteArray_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (PyDict_Check(child.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(child.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::TupleK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle child(PyTuple_GET_ITEM(f.in.ptr(), f.i));
+                f.i++;
+                if (is_scalar_fast(child, lim))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+                if (PyList_Check(child.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (PyTuple_Check(child.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !PyUnicode_Check(child.ptr()) &&
+                    !PyBytes_Check(child.ptr()) &&
+                    !PyByteArray_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (PyDict_Check(child.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(child.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::SeqK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle child(f.seq_items[f.i]);
+                f.i++;
+                if (is_scalar_fast(child, lim))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+                if (PyList_Check(child.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (PyTuple_Check(child.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !PyUnicode_Check(child.ptr()) &&
+                    !PyBytes_Check(child.ptr()) &&
+                    !PyByteArray_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (PyDict_Check(child.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(child.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            Py_DECREF(f.seq_raw);
+            f.seq_raw = nullptr;
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::DictK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle key_h(f.seq_items[f.i]);
+                f.i++;
+                nb::str k = nb::str(key_h); // enforce string key
+                nb::object val = nb::cast<nb::object>(f.in.attr("__getitem__")(key_h));
+
+                if (is_scalar_fast(val, lim))
+                {
+                    nb::dict out = nb::cast<nb::dict>(f.out);
+                    out[k] = nb::object(val, nb::detail::borrow_t{});
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+
+                f.pending_key = k;
+                f.waiting_child = true;
+
+                if (PyList_Check(val.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(val));
+                    continue;
+                }
+                if (PyTuple_Check(val.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(val));
+                    continue;
+                }
+                if (PySequence_Check(val.ptr()) &&
+                    !PyMapping_Check(val.ptr()) &&
+                    !PyDict_Check(val.ptr()) &&
+                    !PyUnicode_Check(val.ptr()) &&
+                    !PyBytes_Check(val.ptr()) &&
+                    !PyByteArray_Check(val.ptr()))
+                {
+                    push_seq(val);
+                    continue;
+                }
+                if (PyDict_Check(val.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(val));
+                    continue;
+                }
+                if (PyMapping_Check(val.ptr()))
+                {
+                    push_map(val);
+                    continue;
+                }
+                if (PySet_Check(val.ptr()) || PyFrozenSet_Check(val.ptr()))
+                {
+                    push_set(val);
+                    continue;
+                }
+                if (PyBytes_Check(val.ptr()) || PyByteArray_Check(val.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(val.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            if (f.seq_raw)
+            {
+                Py_DECREF(f.seq_raw);
+                f.seq_raw = nullptr;
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::MapK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle kvh = f.map_items[f.i];
+                f.i++;
+                nb::tuple kv = nb::cast<nb::tuple>(kvh);
+                nb::str k = nb::str(kv[0]);
+                nb::object val = nb::cast<nb::object>(kv[1]);
+
+                if (is_scalar_fast(val, lim))
+                {
+                    nb::dict out = nb::cast<nb::dict>(f.out);
+                    out[k] = nb::object(val, nb::detail::borrow_t{});
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+
+                f.pending_key = k;
+                f.waiting_child = true;
+
+                if (PyList_Check(val.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(val));
+                    continue;
+                }
+                if (PyTuple_Check(val.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(val));
+                    continue;
+                }
+                if (PySequence_Check(val.ptr()) &&
+                    !PyMapping_Check(val.ptr()) &&
+                    !PyDict_Check(val.ptr()) &&
+                    !PyUnicode_Check(val.ptr()) &&
+                    !PyBytes_Check(val.ptr()) &&
+                    !PyByteArray_Check(val.ptr()))
+                {
+                    push_seq(val);
+                    continue;
+                }
+                if (PyDict_Check(val.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(val));
+                    continue;
+                }
+                if (PyMapping_Check(val.ptr()))
+                {
+                    push_map(val);
+                    continue;
+                }
+                if (PySet_Check(val.ptr()) || PyFrozenSet_Check(val.ptr()))
+                {
+                    push_set(val);
+                    continue;
+                }
+                if (PyBytes_Check(val.ptr()) || PyByteArray_Check(val.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(val.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::SetK)
+        {
+            PyObject *nxt = PyIter_Next(f.iter);
+            if (nxt)
+            {
+                nb::object elem(nb::handle(nxt), nb::detail::steal_t{});
+                if (is_scalar_fast(elem, lim))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(std::move(elem));
+                    check_nodes(nodes, lim.max_nodes);
+                    continue;
+                }
+                if (PyList_Check(elem.ptr()))
+                {
+                    push_list(nb::cast<nb::list>(elem));
+                    continue;
+                }
+                if (PyTuple_Check(elem.ptr()))
+                {
+                    push_tuple(nb::cast<nb::tuple>(elem));
+                    continue;
+                }
+                if (PySequence_Check(elem.ptr()) &&
+                    !PyMapping_Check(elem.ptr()) &&
+                    !PyDict_Check(elem.ptr()) &&
+                    !PyUnicode_Check(elem.ptr()) &&
+                    !PyBytes_Check(elem.ptr()) &&
+                    !PyByteArray_Check(elem.ptr()))
+                {
+                    push_seq(elem);
+                    continue;
+                }
+                if (PyDict_Check(elem.ptr()))
+                {
+                    push_dict(nb::cast<nb::dict>(elem));
+                    continue;
+                }
+                if (PyMapping_Check(elem.ptr()))
+                {
+                    push_map(elem);
+                    continue;
+                }
+                if (PySet_Check(elem.ptr()) || PyFrozenSet_Check(elem.ptr()))
+                {
+                    push_set(elem);
+                    continue;
+                }
+                if (PyBytes_Check(elem.ptr()) || PyByteArray_Check(elem.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                std::string msg = "object type is not JSON-serialisable: ";
+                msg += Py_TYPE(elem.ptr())->tp_name;
+                throw nb::type_error(msg.c_str());
+            }
+            if (PyErr_Occurred())
+                throw nb::python_error();
+            Py_DECREF(f.iter);
+            f.iter = nullptr;
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+    }
+
+    std::string msg = "object type is not JSON-serialisable: ";
+    msg += Py_TYPE(root.ptr())->tp_name;
+    throw nb::type_error(msg.c_str());
+}
+
+// Keep your simple wrapper to preserve existing API
+static nb::object normalize_for_canonical_json(nb::handle root)
+{
+    NormLimits lim;
+    return normalize_for_canonical_json_with_limits(root, lim);
+}
+
+// iterative version for normalization
+static nb::object normalize_for_canonical_json_iterative(nb::handle root)
+{
+    auto is_scalar = [](nb::handle o) -> bool
+    {
+        return o.is_none() ||
+               nb::isinstance<nb::str>(o) ||
+               nb::isinstance<nb::bool_>(o) ||
+               nb::isinstance<nb::int_>(o) ||
+               nb::isinstance<nb::float_>(o);
+    };
+
+    if (is_scalar(root))
+        return nb::object(root, nb::detail::borrow_t{});
+
+    struct Frame
+    {
+        enum Kind
+        {
+            ListK,
+            TupleK,
+            SeqK,
+            DictK,
+            MapK,
+            SetK
+        } kind;
+        nb::object in;    // input container
+        nb::object out;   // output container (nb::list or nb::dict)
+        Py_ssize_t i = 0; // index/position
+        Py_ssize_t n = 0;
+
+        // Fast sequence support (PySequence_Fast)
+        PyObject *seq_raw = nullptr;    // owned when set (DECREF on finish)
+        PyObject **seq_items = nullptr; // pointer from PySequence_Fast_ITEMS
+
+        // Set iterator
+        PyObject *iter = nullptr; // owned when set (DECREF on finish)
+
+        // Mapping items (list of (k, v))
+        nb::list map_items;
+
+        // For dict/map pending value attachment
+        nb::object pending_key; // valid only when waiting_child == true
+        bool waiting_child = false;
+    };
+
+    std::vector<Frame> stack;
+    stack.reserve(32);
+
+    auto push_list = [&](nb::object in_list)
+    {
+        Frame f;
+        f.kind = Frame::ListK;
+        f.in = in_list;
+        f.n = PyList_GET_SIZE(in_list.ptr());
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_tuple = [&](nb::object in_tuple)
+    {
+        Frame f;
+        f.kind = Frame::TupleK;
+        f.in = in_tuple;
+        f.n = PyTuple_GET_SIZE(in_tuple.ptr());
+        f.out = nb::list(); // tuples become lists
+        stack.push_back(std::move(f));
+    };
+
+    auto push_seq = [&](nb::handle in_seq)
+    {
+        Frame f;
+        f.kind = Frame::SeqK;
+        f.in = nb::object(in_seq, nb::detail::borrow_t{});
+        f.seq_raw = PySequence_Fast(in_seq.ptr(), "expected a sequence");
+        if (!f.seq_raw)
+            throw nb::python_error();
+        f.n = PySequence_Fast_GET_SIZE(f.seq_raw);
+        f.seq_items = PySequence_Fast_ITEMS(f.seq_raw);
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_dict = [&](nb::object in_dict)
+    {
+        Frame f;
+        f.kind = Frame::DictK;
+        f.in = in_dict;
+        f.out = nb::dict();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_map = [&](nb::handle in_map)
+    {
+        Frame f;
+        f.kind = Frame::MapK;
+        f.in = nb::object(in_map, nb::detail::borrow_t{});
+        PyObject *items_raw = PyMapping_Items(in_map.ptr()); // new ref
+        if (!items_raw)
+            throw nb::python_error();
+        nb::object items_obj(nb::handle(items_raw), nb::detail::steal_t{});
+        f.map_items = nb::cast<nb::list>(items_obj);
+        f.n = PyList_GET_SIZE(f.map_items.ptr());
+        f.out = nb::dict();
+        stack.push_back(std::move(f));
+    };
+
+    auto push_set = [&](nb::handle in_set)
+    {
+        Frame f;
+        f.kind = Frame::SetK;
+        f.in = nb::object(in_set, nb::detail::borrow_t{});
+        f.iter = PyObject_GetIter(in_set.ptr());
+        if (!f.iter)
+            throw nb::python_error();
+        f.out = nb::list();
+        stack.push_back(std::move(f));
+    };
+
+    // Initialize from root (preserve your original branching rules and exclusions)
+    if (nb::isinstance<nb::list>(root))
+    {
+        push_list(nb::cast<nb::list>(root));
+    }
+    else if (nb::isinstance<nb::tuple>(root))
+    {
+        push_tuple(nb::cast<nb::tuple>(root));
+    }
+    else if (PySequence_Check(root.ptr()) &&
+             !PyMapping_Check(root.ptr()) &&
+             !PyDict_Check(root.ptr()) &&
+             !nb::isinstance<nb::str>(root) &&
+             !PyBytes_Check(root.ptr()))
+    {
+        push_seq(root);
+    }
+    else if (nb::isinstance<nb::dict>(root))
+    {
+        push_dict(nb::cast<nb::dict>(root));
+    }
+    else if (PyMapping_Check(root.ptr()))
+    {
+        push_map(root);
+    }
+    else if (PySet_Check(root.ptr()) || PyFrozenSet_Check(root.ptr()))
+    {
+        push_set(root);
+    }
+    else if (PyBytes_Check(root.ptr()) || PyByteArray_Check(root.ptr()))
+    {
+        throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+    }
+    else
+    {
+        throw nb::type_error("object type is not JSON-serialisable");
+    }
+
+    // Generic child completion handler: attach 'done' to current parent frame
+    auto attach_done_to_parent = [&](const nb::object &done)
+    {
+        Frame &parent = stack.back();
+        switch (parent.kind)
+        {
+        case Frame::ListK:
+        case Frame::TupleK:
+        case Frame::SeqK:
+        case Frame::SetK:
+        {
+            nb::list out = nb::cast<nb::list>(parent.out);
+            out.append(done);
+            break;
+        }
+        case Frame::DictK:
+        case Frame::MapK:
+        {
+            if (!parent.waiting_child)
+                throw nb::type_error("internal error: mapping parent not waiting for child");
+            nb::dict out = nb::cast<nb::dict>(parent.out);
+            out[parent.pending_key] = done;
+            parent.pending_key = nb::object();
+            parent.waiting_child = false;
+            break;
+        }
+        }
+    };
+
+    nb::object child_result; // holds the result of the most recently completed child
+
+    while (!stack.empty())
+    {
+        Frame &f = stack.back();
+
+        if (f.kind == Frame::ListK)
+        {
+            if (f.i < f.n)
+            {
+                PyObject *item = PyList_GET_ITEM(f.in.ptr(), f.i); // borrowed
+                f.i++;
+                nb::handle child(item);
+                if (is_scalar(child))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    continue;
+                }
+                if (nb::isinstance<nb::list>(child))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(child))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !nb::isinstance<nb::str>(child) &&
+                    !PyBytes_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(child))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+            // done with this frame
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::TupleK)
+        {
+            if (f.i < f.n)
+            {
+                PyObject *item = PyTuple_GET_ITEM(f.in.ptr(), f.i); // borrowed
+                f.i++;
+                nb::handle child(item);
+                if (is_scalar(child))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    continue;
+                }
+                if (nb::isinstance<nb::list>(child))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(child))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !nb::isinstance<nb::str>(child) &&
+                    !PyBytes_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(child))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::SeqK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle child(f.seq_items[f.i]);
+                f.i++;
+                if (is_scalar(child))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(nb::object(child, nb::detail::borrow_t{}));
+                    continue;
+                }
+                if (nb::isinstance<nb::list>(child))
+                {
+                    push_list(nb::cast<nb::list>(child));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(child))
+                {
+                    push_tuple(nb::cast<nb::tuple>(child));
+                    continue;
+                }
+                if (PySequence_Check(child.ptr()) &&
+                    !PyMapping_Check(child.ptr()) &&
+                    !PyDict_Check(child.ptr()) &&
+                    !nb::isinstance<nb::str>(child) &&
+                    !PyBytes_Check(child.ptr()))
+                {
+                    push_seq(child);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(child))
+                {
+                    push_dict(nb::cast<nb::dict>(child));
+                    continue;
+                }
+                if (PyMapping_Check(child.ptr()))
+                {
+                    push_map(child);
+                    continue;
+                }
+                if (PySet_Check(child.ptr()) || PyFrozenSet_Check(child.ptr()))
+                {
+                    push_set(child);
+                    continue;
+                }
+                if (PyBytes_Check(child.ptr()) || PyByteArray_Check(child.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+            Py_DECREF(f.seq_raw);
+            f.seq_raw = nullptr;
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::DictK)
+        {
+            // Initialize keys fast sequence once
+            if (f.i == 0 && f.seq_raw == nullptr)
+            {
+                nb::object keys_obj = f.in.attr("keys")();
+                f.seq_raw = PySequence_Fast(keys_obj.ptr(), "expected a sequence");
+                if (!f.seq_raw)
+                    throw nb::python_error();
+                f.n = PySequence_Fast_GET_SIZE(f.seq_raw);
+                f.seq_items = PySequence_Fast_ITEMS(f.seq_raw);
+            }
+
+            // If resuming from a child, attach was handled in generic pop; nothing to do here.
+
+            if (f.i < f.n)
+            {
+                nb::handle key_h(f.seq_items[f.i]); // borrowed
+                f.i++;
+                nb::str k = nb::str(key_h); // enforce string key
+                nb::object val = nb::cast<nb::object>(f.in.attr("__getitem__")(key_h));
+
+                if (is_scalar(val))
+                {
+                    nb::dict out = nb::cast<nb::dict>(f.out);
+                    out[k] = nb::object(val, nb::detail::borrow_t{});
+                    continue;
+                }
+
+                // Descend; mark pending key
+                f.pending_key = k;
+                f.waiting_child = true;
+
+                if (nb::isinstance<nb::list>(val))
+                {
+                    push_list(nb::cast<nb::list>(val));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(val))
+                {
+                    push_tuple(nb::cast<nb::tuple>(val));
+                    continue;
+                }
+                if (PySequence_Check(val.ptr()) &&
+                    !PyMapping_Check(val.ptr()) &&
+                    !PyDict_Check(val.ptr()) &&
+                    !nb::isinstance<nb::str>(val) &&
+                    !PyBytes_Check(val.ptr()))
+                {
+                    push_seq(val);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(val))
+                {
+                    push_dict(nb::cast<nb::dict>(val));
+                    continue;
+                }
+                if (PyMapping_Check(val.ptr()))
+                {
+                    push_map(val);
+                    continue;
+                }
+                if (PySet_Check(val.ptr()) || PyFrozenSet_Check(val.ptr()))
+                {
+                    push_set(val);
+                    continue;
+                }
+                if (PyBytes_Check(val.ptr()) || PyByteArray_Check(val.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+
+            // done dict
+            if (f.seq_raw)
+            {
+                Py_DECREF(f.seq_raw);
+                f.seq_raw = nullptr;
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::MapK)
+        {
+            if (f.i < f.n)
+            {
+                nb::handle kvh = f.map_items[f.i];
+                f.i++;
+                nb::tuple kv = nb::cast<nb::tuple>(kvh);
+                nb::str k = nb::str(kv[0]); // enforce string key
+                nb::object val = nb::cast<nb::object>(kv[1]);
+
+                if (is_scalar(val))
+                {
+                    nb::dict out = nb::cast<nb::dict>(f.out);
+                    out[k] = nb::object(val, nb::detail::borrow_t{});
+                    continue;
+                }
+
+                f.pending_key = k;
+                f.waiting_child = true;
+
+                if (nb::isinstance<nb::list>(val))
+                {
+                    push_list(nb::cast<nb::list>(val));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(val))
+                {
+                    push_tuple(nb::cast<nb::tuple>(val));
+                    continue;
+                }
+                if (PySequence_Check(val.ptr()) &&
+                    !PyMapping_Check(val.ptr()) &&
+                    !PyDict_Check(val.ptr()) &&
+                    !nb::isinstance<nb::str>(val) &&
+                    !PyBytes_Check(val.ptr()))
+                {
+                    push_seq(val);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(val))
+                {
+                    push_dict(nb::cast<nb::dict>(val));
+                    continue;
+                }
+                if (PyMapping_Check(val.ptr()))
+                {
+                    push_map(val);
+                    continue;
+                }
+                if (PySet_Check(val.ptr()) || PyFrozenSet_Check(val.ptr()))
+                {
+                    push_set(val);
+                    continue;
+                }
+                if (PyBytes_Check(val.ptr()) || PyByteArray_Check(val.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+
+        if (f.kind == Frame::SetK)
+        {
+            PyObject *nxt = PyIter_Next(f.iter);
+            if (nxt)
+            {
+                nb::object elem(nb::handle(nxt), nb::detail::steal_t{});
+                if (is_scalar(elem))
+                {
+                    nb::list out = nb::cast<nb::list>(f.out);
+                    out.append(std::move(elem));
+                    continue;
+                }
+                if (nb::isinstance<nb::list>(elem))
+                {
+                    push_list(nb::cast<nb::list>(elem));
+                    continue;
+                }
+                if (nb::isinstance<nb::tuple>(elem))
+                {
+                    push_tuple(nb::cast<nb::tuple>(elem));
+                    continue;
+                }
+                if (PySequence_Check(elem.ptr()) &&
+                    !PyMapping_Check(elem.ptr()) &&
+                    !PyDict_Check(elem.ptr()) &&
+                    !nb::isinstance<nb::str>(elem) &&
+                    !PyBytes_Check(elem.ptr()))
+                {
+                    push_seq(elem);
+                    continue;
+                }
+                if (nb::isinstance<nb::dict>(elem))
+                {
+                    push_dict(nb::cast<nb::dict>(elem));
+                    continue;
+                }
+                if (PyMapping_Check(elem.ptr()))
+                {
+                    push_map(elem);
+                    continue;
+                }
+                if (PySet_Check(elem.ptr()) || PyFrozenSet_Check(elem.ptr()))
+                {
+                    push_set(elem);
+                    continue;
+                }
+                if (PyBytes_Check(elem.ptr()) || PyByteArray_Check(elem.ptr()))
+                    throw nb::type_error("bytes/bytearray are not JSON-serialisable");
+                throw nb::type_error("object type is not JSON-serialisable");
+            }
+            if (PyErr_Occurred())
+                throw nb::python_error();
+            Py_DECREF(f.iter);
+            f.iter = nullptr;
+            nb::object done = f.out;
+            stack.pop_back();
+            if (stack.empty())
+                return done;
+            attach_done_to_parent(done);
+            continue;
+        }
+    }
+
+    // Unreachable on success
     throw nb::type_error("object type is not JSON-serialisable");
 }
 
@@ -526,21 +1663,21 @@ NB_MODULE(_event_signing_impl, m)
           { return key_id.starts_with("ed25519:"); });
     m.def("encode_canonical_json", [](const nb::object &input)
           {
-    if (input.ptr() == Py_None)
-        return nb::bytes("null", 4);
-
-    // Fast path: input is already JSON text. Skip normalization.
-    if (nb::isinstance<nb::str>(input) || nb::isinstance<nb::bytes>(input)) {
+    if (input.ptr() == Py_None ||
+        PyBool_Check(input.ptr()) ||
+        PyLong_Check(input.ptr()) ||
+        PyFloat_Check(input.ptr()) ||
+        PyUnicode_Check(input.ptr()) ||
+        PyBytes_Check(input.ptr())) {
         init_json_buffer();
-        py_to_canonical_json_fast(input);  // feed text/bytes directly
+        py_to_canonical_json_fast(input);
         auto span = get_json_span();
         return nb::bytes(span.data(), span.size());
     }
 
-    // Object path: normalize to JSON-native types
     nb::object processed = normalize_for_canonical_json(input);
 
-    if (nb::isinstance<nb::dict>(processed)) {
+    if (PyDict_Check(processed.ptr())) {
         nb::dict d = nb::cast<nb::dict>(processed);
         init_json_buffer(d.size());
     } else {
@@ -548,7 +1685,6 @@ NB_MODULE(_event_signing_impl, m)
     }
 
     py_to_canonical_json_fast(processed);
-
     auto span = get_json_span();
     return nb::bytes(span.data(), span.size()); }, nb::arg("input").none(true));
 
