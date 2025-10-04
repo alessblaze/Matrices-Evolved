@@ -1080,7 +1080,13 @@ impl UnifiedCache {
     /// Updates LRU position and hierarchy relationships for tuple keys.
     /// Time complexity: O(k) where k is tuple length for hierarchy operations.
     pub fn set(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>, callbacks: Vec<Py<PyAny>>) -> PyResult<Vec<Py<PyAny>>> {
-        let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let cache_key = match CacheKey::from_bound(key) {
+            Ok(key) => Arc::new(key),
+            Err(e) => {
+                rust_debug_fast!("Failed to create cache key: {}", e);
+                return Ok(Vec::new());
+            }
+        };
         let shard_index = self.get_shard_index(&cache_key);
 
         let original_key = key.clone().unbind();
@@ -1285,7 +1291,18 @@ impl UnifiedCache {
     /// Records cache hit/miss metrics if metrics are configured and update_metrics is true.
     /// Time complexity: O(1) for HashMap lookup and LRU update.
     pub fn get(&self, py: Python, key: &Bound<'_, PyAny>, callbacks: Option<Vec<Py<PyAny>>>, update_metrics: bool, update_last_access: bool) -> PyResult<Option<Py<PyAny>>> {
-        let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let cache_key = match CacheKey::from_bound(key) {
+            Ok(key) => Arc::new(key),
+            Err(_) => {
+                if update_metrics {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref metrics) = self.metrics {
+                        let _ = metrics.bind(py).call_method0("inc_misses");
+                    }
+                }
+                return Ok(None);
+            }
+        };
         let shard_index = self.get_shard_index(&cache_key);
 
         // First, check if entry exists and get data for callback deduplication
@@ -1367,7 +1384,13 @@ impl UnifiedCache {
     /// Time complexity: O(k) where k is tuple length for hierarchy cleanup.
     pub fn invalidate(&self, py: Python, key: &Bound<'_, PyAny>) -> PyResult<(bool, Vec<Py<PyAny>>)> {
         rust_debug_fast!("UnifiedCache::invalidate() called");
-        let cache_key = Arc::new(CacheKey::from_bound(key)?);
+        let cache_key = match CacheKey::from_bound(key) {
+            Ok(key) => Arc::new(key),
+            Err(_) => {
+                rust_debug_fast!("Entry not found - invalid key");
+                return Ok((false, Vec::new()));
+            }
+        };
         self.invalidate_by_key(py, &cache_key)
     }
     

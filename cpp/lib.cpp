@@ -234,63 +234,103 @@ NB_MODULE(_event_signing_impl, m) {
         return nb::str(result.c_str());
     }, "input_bytes"_a, "urlsafe"_a = false);
     // Padded base64 encoding function
-    m.def("encode_base64_padded", [](nb::bytes data, bool urlsafe = false) {
-        const char* ptr = static_cast<const char*>(data.c_str());
-        size_t size = data.size();
-        std::vector<uint8_t> vec_data(ptr, ptr + size);
+    m.def("encode_base64_padded", [](const nb::object& data, bool urlsafe = false) {
+        DEBUG_LOG("encode_base64_padded called, urlsafe=" + std::string(urlsafe ? "true" : "false"));
+        
+        if (data.ptr() == Py_None) {
+            DEBUG_LOG("encode_base64_padded: None input, throwing exception");
+            throw std::invalid_argument("argument should be a bytes-like object or ASCII string, not 'NoneType'");
+        }
+        
+        std::vector<uint8_t> vec_data;
+        if (nb::isinstance<nb::bytes>(data)) {
+            nb::bytes bytes_data = nb::cast<nb::bytes>(data);
+            const char* ptr = static_cast<const char*>(bytes_data.c_str());
+            size_t size = bytes_data.size();
+            vec_data = std::vector<uint8_t>(ptr, ptr + size);
+            DEBUG_LOG("encode_base64_padded: bytes input, size=" + std::to_string(size));
+        } else {
+            vec_data = nb::cast<std::vector<uint8_t>>(data);
+            DEBUG_LOG("encode_base64_padded: vector input, size=" + std::to_string(vec_data.size()));
+        }
+        
         std::string result = base64_encode(vec_data);
+        DEBUG_LOG("encode_base64_padded: unpadded result=" + result + ", length=" + std::to_string(result.length()));
         
         // Add padding
         size_t padding_needed = (4 - (result.length() % 4)) % 4;
         result.append(padding_needed, '=');
+        DEBUG_LOG("encode_base64_padded: padded result=" + result + ", padding_added=" + std::to_string(padding_needed));
         
         // Convert to URL-safe if requested
         if (urlsafe) {
             std::replace(result.begin(), result.end(), '+', '-');
             std::replace(result.begin(), result.end(), '/', '_');
+            DEBUG_LOG("encode_base64_padded: urlsafe result=" + result);
         }
         
-        return nb::str(result.c_str());
-    }, "input_bytes"_a, "urlsafe"_a = false);
+        auto output = nb::bytes(result.c_str(), result.size());
+        DEBUG_LOG("encode_base64_padded: returning bytes, size=" + std::to_string(result.size()));
+        return output;
+    }, nb::arg("data").none(true), "urlsafe"_a = false);
     m.def("decode_base64", [](const std::string& encoded) {
         auto result = base64_decode(encoded);
         return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
     });
     // Padded base64 decoding function
-    m.def("decode_base64_padded", [](const std::string& encoded) {
-        std::string input = encoded;
+    m.def("decode_base64_padded", [](const nb::object& encoded) {
+        DEBUG_LOG("decode_base64_padded called");
+        
+        if (encoded.ptr() == Py_None) {
+            DEBUG_LOG("decode_base64_padded: None input, throwing exception");
+            throw std::invalid_argument("argument should be a bytes-like object or ASCII string, not 'NoneType'");
+        }
+        
+        std::string input;
+        if (nb::isinstance<nb::str>(encoded)) {
+            input = nb::cast<std::string>(encoded);
+            DEBUG_LOG("decode_base64_padded: string input=" + input + ", length=" + std::to_string(input.length()));
+        } else if (nb::isinstance<nb::bytes>(encoded)) {
+            nb::bytes bytes_data = nb::cast<nb::bytes>(encoded);
+            const char* ptr = static_cast<const char*>(bytes_data.c_str());
+            size_t size = bytes_data.size();
+            input = std::string(ptr, size);
+            DEBUG_LOG("decode_base64_padded: bytes input=" + input + ", length=" + std::to_string(size));
+        } else {
+            DEBUG_LOG("decode_base64_padded: invalid input type, throwing exception");
+            throw std::invalid_argument("argument should be a bytes-like object or ASCII string");
+        }
+        
+        std::string original_input = input;
+        
+        // Remove whitespace (spaces, newlines, tabs, etc.) like standard library does
+        input.erase(std::remove_if(input.begin(), input.end(), [](char c) {
+            return std::isspace(static_cast<unsigned char>(c));
+        }), input.end());
+        DEBUG_LOG("decode_base64_padded: after whitespace removal=" + input + ", length=" + std::to_string(input.length()));
         
         // Convert URL-safe characters back to standard base64
         std::replace(input.begin(), input.end(), '-', '+');
         std::replace(input.begin(), input.end(), '_', '/');
-        
-        // Remove existing padding
-        while (!input.empty() && input.back() == '=') {
-            input.pop_back();
+        if (input != original_input) {
+            DEBUG_LOG("decode_base64_padded: after URL-safe conversion=" + input);
         }
         
-        // Use existing base64_decode which handles unpadded input
-        auto result = base64_decode(input);
-        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
-    });
-    m.def("decode_base64_padded", [](nb::bytes encoded) {
-        const char* ptr = static_cast<const char*>(encoded.c_str());
-        size_t size = encoded.size();
-        std::string input(ptr, size);
-        
-        // Convert URL-safe characters back to standard base64
-        std::replace(input.begin(), input.end(), '-', '+');
-        std::replace(input.begin(), input.end(), '_', '/');
-        
-        // Remove existing padding
+        // Remove padding since internal base64_decode only accepts unpadded input
+        size_t padding_removed = 0;
         while (!input.empty() && input.back() == '=') {
             input.pop_back();
+            padding_removed++;
         }
+        DEBUG_LOG("decode_base64_padded: after padding removal=" + input + ", padding_removed=" + std::to_string(padding_removed));
         
-        // Use existing base64_decode which handles unpadded input
         auto result = base64_decode(input);
-        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
-    });
+        DEBUG_LOG("decode_base64_padded: decoded " + std::to_string(result.size()) + " bytes");
+        
+        auto output = nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
+        DEBUG_LOG("decode_base64_padded: returning bytes, size=" + std::to_string(result.size()));
+        return output;
+    }, nb::arg("encoded").none(true));
     m.def("encode_verify_key_base64", [](const std::vector<uint8_t>& key_bytes) {
         return nb::str(base64_encode(key_bytes).c_str());
     });
