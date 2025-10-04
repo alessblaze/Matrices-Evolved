@@ -2139,8 +2139,8 @@ impl RustLruCache {
     ) -> Self {
         let name = cache_name.unwrap_or_else(|| "rust_cache".to_string());
         let policy = match callback_policy.as_deref() {
-            Some("append") => CallbackPolicy::Append,
-            _ => CallbackPolicy::Replace,
+            Some("replace") => CallbackPolicy::Replace,
+            _ => CallbackPolicy::Append,
         };
         let cache = Arc::new(RwLock::new(UnifiedCache::new_with_shards(name.clone(), max_size, metrics, policy, shard_count)));
         
@@ -2593,8 +2593,8 @@ impl AsyncRustLruCache {
         rust_debug_fast!("AsyncRustLruCache::new() called with max_size={}", max_size);
         let name = cache_name.unwrap_or_else(|| "async_rust_cache".to_string());
         let policy = match callback_policy.as_deref() {
-            Some("append") => CallbackPolicy::Append,
-            _ => CallbackPolicy::Replace,
+            Some("replace") => CallbackPolicy::Replace,
+            _ => CallbackPolicy::Append,
         };
         rust_debug_fast!("Creating AsyncMutex<UnifiedCache>");
         let cache = Arc::new(AsyncRwLock::new(UnifiedCache::new_with_shards(name.clone(), max_size, metrics, policy, None)));
