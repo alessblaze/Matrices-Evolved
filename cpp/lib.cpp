@@ -1528,6 +1528,11 @@ NB_MODULE(_event_signing_impl, m)
             return std::isspace(static_cast<unsigned char>(c));
         }), clean_encoded.end());
         
+        // Strip padding if present (matrices_evolved base64_decode expects unpadded input)
+        while (!clean_encoded.empty() && clean_encoded.back() == '=') {
+            clean_encoded.pop_back();
+        }
+        
         auto result = base64_decode(clean_encoded);
         return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size()); });
     // Padded base64 decoding function
@@ -1653,6 +1658,8 @@ NB_MODULE(_event_signing_impl, m)
             key_bytes = nb::cast<std::vector<uint8_t>>(key_data);
         }
         
+        // Accept any key_id that starts with "ed25519:" and has 32-byte key data
+        // This matches signedjson behavior which is more lenient
         if (key_id.starts_with("ed25519:") && key_bytes.size() == 32) {
             size_t colon_pos = key_id.find(':');
             std::string version = (colon_pos != std::string::npos) ? std::string(key_id.substr(colon_pos + 1)) : "1";
