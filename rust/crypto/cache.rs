@@ -648,10 +648,12 @@ impl UnifiedCache {
     }
     
     fn add_to_front_shard(&self, shard: &mut CacheShard, key: Arc<CacheKey>) {
+        // Insert the node first to ensure it exists before updating pointers
         let node = Box::new(LruNode {
             prev: None,
             next: shard.head.clone(),
         });
+        shard.lru_nodes.insert(key.clone(), node);
         
         if let Some(old_head) = &shard.head {
             // Update the old head's prev pointer to point to the new head
@@ -664,10 +666,7 @@ impl UnifiedCache {
             shard.tail = Some(key.clone());
         }
         
-        shard.lru_nodes.insert(key.clone(), node);
         shard.head = Some(key.clone());
-        
-
     }
     
 
@@ -864,10 +863,52 @@ impl UnifiedCache {
 
     
     /// Invalidates all cache entries that have the specified prefix.
+    /// Also removes the prefix key itself if it exists as an exact match.
     pub fn invalidate_prefix(&self, py: Python, prefix_key: &Arc<CacheKey>) -> Vec<(Arc<CacheKey>, CacheEntry)> {
         let mut removed_entries = Vec::new();
         
-        // Get children from global hierarchy
+        // First, check if the prefix_key itself exists and remove it
+        let shard_index = self.get_shard_index(prefix_key);
+        let (entry, value_copy) = {
+            let mut shard = self.shards[shard_index].write();
+            if let Some(entry) = shard.data.remove(prefix_key) {
+                let value_copy = entry.value.clone_ref(py);
+                self.remove_from_lru_shard(&mut shard, prefix_key);
+                (Some(entry), Some(value_copy))
+            } else {
+                (None, None)
+            }
+        };
+        
+        if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+            // Calculate size outside lock
+            let size = if self.size_callback.read().is_some() {
+                self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+            } else {
+                DEFAULT_ENTRY_SIZE
+            };
+            
+            // Update size tracking
+            {
+                let mut shard = self.shards[shard_index].write();
+                shard.current_size = shard.current_size.saturating_sub(size);
+            }
+            self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+            
+            // Remove from global eviction list
+            if let Some(node_id) = entry.node_id {
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_node(node_id);
+            }
+            
+            let prefix_arcs = entry.prefix_arcs.clone();
+            if let Some(arcs) = prefix_arcs.as_ref() {
+                Self::remove_hierarchy_static(prefix_key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+            }
+            removed_entries.push((prefix_key.clone(), entry));
+        }
+        
+        // Then, get children from global hierarchy
         let child_keys: Vec<_> = {
             let hierarchy = self.hierarchy.read();
             if let Some(children) = hierarchy.get(prefix_key) {
@@ -877,7 +918,7 @@ impl UnifiedCache {
             }
         };
         
-        // Remove entries from appropriate shards
+        // Remove child entries from appropriate shards
         for child_key in child_keys {
             let shard_index = self.get_shard_index(&child_key);
             
@@ -2406,7 +2447,7 @@ impl RustLruCache {
         self.get_prefix_children(py, prefix_key)
     }
     
-    /// TreeCache multi-delete - removes all entries with prefix
+    /// TreeCache multi-delete - removes all entries with prefix and the key itself if it exists
     fn del_multi(&self, py: Python, prefix_key: &Bound<'_, PyAny>) -> PyResult<usize> {
         self.invalidate_prefix(py, prefix_key)
     }

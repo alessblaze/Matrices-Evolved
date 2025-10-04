@@ -29,6 +29,7 @@ You should have received a copy of the License along with this program; if not, 
 #include <vector>
 #include <cstdlib>
 #include <nanobind/nanobind.h>
+#include <nanobind/make_iterator.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
@@ -90,7 +91,7 @@ static bool debug_enabled = []() {
 static constexpr char hex_lut[] = "0123456789abcdef";
 
 // Maximum event size to prevent DoS attacks
-static constexpr size_t MAX_EVENT_SIZE = 256 * 1024; // 256 KB
+static constexpr size_t MAX_EVENT_SIZE = 1024 * 1024; // 1 MB
 
 // Shared exception classes
 class SignatureVerifyException : public std::runtime_error {
