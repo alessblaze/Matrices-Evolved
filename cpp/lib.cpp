@@ -38,80 +38,187 @@ You should have received a copy of the License along with this program; if not, 
 #include <charconv>
 #include <cmath>
 #include <type_traits>
-
 #include <Python.h>
-
 // Module includes - restructured cpp directory (header-only)
 #include "base64/encoders/include/base64-encoder.h"
 #include "base64/decoders/include/base64-decoder.h"
 #include "json/canonicalization.h"
 #include "crypto/ed25519.h"
 
-// Debug logging infrastructure
-
-// Force recompilation - timestamp change 2
-
-
-
-
 namespace nb = nanobind;
 using namespace nb::literals;
 namespace json = boost::json;
 
 // Memory leak profiling
-static bool leak_warnings_enabled = []() {
-    const char* env = std::getenv("SYNAPSE_RUST_CRYPTO_LEAK_WARNINGS");
+static bool leak_warnings_enabled = []()
+{
+    const char *env = std::getenv("SYNAPSE_RUST_CRYPTO_LEAK_WARNINGS");
     return env && std::string(env) == "1";
 }();
+// This version uses recursion currently not advised for very deep structures and production usage
+static nb::object normalize_for_canonical_json(nb::handle obj)
+{
+    // Null
+    if (obj.is_none())
+        return nb::object(obj, nb::detail::borrow_t{});
 
-// SignatureVerifyException is now defined in debug.h
+    // Fast path for native JSON scalars
+    if (nb::isinstance<nb::str>(obj) ||
+        nb::isinstance<nb::bool_>(obj) ||
+        nb::isinstance<nb::int_>(obj) ||
+        nb::isinstance<nb::float_>(obj))
+    {
+        // Note: floats must be finite; let encoder reject NaN/Inf if present
+        return nb::object(obj, nb::detail::borrow_t{});
+    }
 
+    // Native list -> list (recursive normalize)
+    if (nb::isinstance<nb::list>(obj))
+    {
+        nb::list in = nb::cast<nb::list>(obj);
+        nb::list out;
+        for (nb::handle v : in)
+            out.append(normalize_for_canonical_json(v));
+        return out;
+    }
 
+    // tuple -> list
+    if (nb::isinstance<nb::tuple>(obj))
+    {
+        nb::tuple t = nb::cast<nb::tuple>(obj);
+        nb::list out;
+        for (size_t i = 0; i < t.size(); ++i)
+            out.append(normalize_for_canonical_json(t[i]));
+        return out;
+    }
 
-NB_MODULE(_event_signing_impl, m) {
-    // Initialize debug system    
+    // generic sequence -> list
+    // MINIMAL FIX: exclude mappings/dicts/strings/bytes so they can’t become lists of keys
+    if (PySequence_Check(obj.ptr()) &&
+        !PyMapping_Check(obj.ptr()) &&
+        !PyDict_Check(obj.ptr()) &&
+        !nb::isinstance<nb::str>(obj) &&
+        !PyBytes_Check(obj.ptr()))
+    {
+        PyObject *seq_raw = PySequence_Fast(obj.ptr(), "expected a sequence");
+        if (!seq_raw)
+            throw nb::python_error();
+        nb::object seq_obj(nb::handle(seq_raw), nb::detail::steal_t{});
+        nb::list out;
+        Py_ssize_t n = PySequence_Fast_GET_SIZE(seq_raw);
+        PyObject **items = PySequence_Fast_ITEMS(seq_raw);
+        for (Py_ssize_t i = 0; i < n; ++i)
+            out.append(normalize_for_canonical_json(nb::handle(items[i])));
+        return out;
+    }
+
+    // dict -> dict with normalized values; enforce string keys
+    if (nb::isinstance<nb::dict>(obj))
+    {
+        nb::dict in = nb::cast<nb::dict>(obj);
+        nb::dict out;
+        for (auto item : in)
+        {
+            nb::str k = nb::str(item.first); // enforce JSON string key
+            out[k] = normalize_for_canonical_json(item.second);
+        }
+        return out;
+    }
+
+    // Mapping (immutabledict/frozendict/etc.) -> dict
+    if (PyMapping_Check(obj.ptr()))
+    {
+        PyObject *items_raw = PyMapping_Items(obj.ptr()); // new ref: list[(k,v)]
+        if (!items_raw)
+            throw nb::python_error();
+        nb::object items_obj(nb::handle(items_raw), nb::detail::steal_t{});
+        nb::list seq = nb::cast<nb::list>(items_obj);
+        nb::dict out;
+        for (nb::handle kvh : seq)
+        {
+            nb::tuple kv = nb::cast<nb::tuple>(kvh);
+            nb::str k = nb::str(kv[0]); // enforce JSON string key
+            out[k] = normalize_for_canonical_json(kv[1]);
+        }
+        return out;
+    }
+
+    // Set/frozenset -> list
+    if (PySet_Check(obj.ptr()) || PyFrozenSet_Check(obj.ptr()))
+    {
+        nb::list out;
+        PyObject *it = PyObject_GetIter(obj.ptr());
+        if (!it)
+            throw nb::python_error();
+        nb::object it_obj(nb::handle(it), nb::detail::steal_t{});
+        for (;;)
+        {
+            PyObject *nxt = PyIter_Next(it);
+            if (!nxt)
+            {
+                if (PyErr_Occurred())
+                    throw nb::python_error();
+                break;
+            }
+            nb::object elem(nb::handle(nxt), nb::detail::steal_t{});
+            out.append(normalize_for_canonical_json(elem));
+        }
+        return out;
+    }
+
+    // Bytes/bytearray: reject (policy can be added if needed)
+    if (PyBytes_Check(obj.ptr()))
+        throw nb::type_error("bytes are not JSON-serialisable");
+    if (PyByteArray_Check(obj.ptr()))
+        throw nb::type_error("bytearray is not JSON-serialisable");
+
+    // Unknown: reject
+    throw nb::type_error("object type is not JSON-serialisable");
+}
+
+NB_MODULE(_event_signing_impl, m)
+{
+    // Initialize debug system
     // Enable leak warnings only when explicitly requested for profiling
     // Set SYNAPSE_RUST_CRYPTO_LEAK_WARNINGS=1 to enable
     nb::set_leak_warnings(leak_warnings_enabled);
-    
+
     // AWS-LC doesn't require explicit initialization
-    
+
     nb::exception<SignatureVerifyException>(m, "SignatureVerifyException");
-    
+
     nb::class_<Signature>(m, "Signature")
         .def_rw("signature", &Signature::signature);
-    
+
     nb::class_<SigningResult>(m, "SigningResult")
         .def_rw("signature", &SigningResult::signature)
         .def_rw("key_id", &SigningResult::key_id)
         .def_rw("algorithm", &SigningResult::algorithm);
-    
+
     nb::class_<VerificationResult>(m, "VerificationResult")
         .def_rw("valid", &VerificationResult::valid)
         .def_rw("user_id", &VerificationResult::user_id)
         .def_rw("device_valid", &VerificationResult::device_valid);
-    
+
     nb::class_<VerifyKey>(m, "VerifyKey")
-        .def(nb::init<const std::vector<uint8_t>&, const std::string&, const std::string&>(),
+        .def(nb::init<const std::vector<uint8_t> &, const std::string &, const std::string &>(),
              "bytes"_a, "alg"_a = "ed25519", "version"_a = "1")
         .def("encode", &VerifyKey::encode)
         .def("verify", &VerifyKey::verify)
-        .def("__eq__", [](const VerifyKey& self, const VerifyKey& other) {
-            return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version;
-        })
+        .def("__eq__", [](const VerifyKey &self, const VerifyKey &other)
+             { return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version; })
         .def_rw("alg", &VerifyKey::alg)
         .def_rw("version", &VerifyKey::version);
-    
+
     nb::class_<VerifyKeyWithExpiry, VerifyKey>(m, "VerifyKeyWithExpiry")
-        .def(nb::init<const std::vector<uint8_t>&, const std::string&, const std::string&>(),
+        .def(nb::init<const std::vector<uint8_t> &, const std::string &, const std::string &>(),
              "bytes"_a, "alg"_a = "ed25519", "version"_a = "1")
-        .def("__eq__", [](const VerifyKeyWithExpiry& self, const VerifyKey& other) {
-            return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version;
-        })
+        .def("__eq__", [](const VerifyKeyWithExpiry &self, const VerifyKey &other)
+             { return self.key_bytes == other.key_bytes && self.alg == other.alg && self.version == other.version; })
         .def_rw("expired", &VerifyKeyWithExpiry::expired);
-    
+
     nb::class_<SigningKey>(m, "SigningKey")
-        .def(nb::init<const std::vector<uint8_t>&, const std::string&, const std::string&>(),
+        .def(nb::init<const std::vector<uint8_t> &, const std::string &, const std::string &>(),
              "bytes"_a, "alg"_a = "ed25519", "version"_a = "1")
         .def_static("generate", &SigningKey::generate)
         .def("encode", &SigningKey::encode)
@@ -121,45 +228,43 @@ NB_MODULE(_event_signing_impl, m) {
         .def_rw("alg", &SigningKey::alg)
         .def_rw("version", &SigningKey::version)
         .def("__bytes__", &SigningKey::encode)
-        .def("__len__", [](const SigningKey& self) { return self.key_bytes.size(); })
-        .def("__iter__", [](const SigningKey& self) {
-            return nb::make_iterator(nb::type<SigningKey>(), "iterator", self.key_bytes.begin(), self.key_bytes.end());
-        });
-    
-    m.def("compute_content_hash_fast", [](const std::vector<uint8_t>& json_bytes) {
+        .def("__len__", [](const SigningKey &self)
+             { return self.key_bytes.size(); })
+        .def("__iter__", [](const SigningKey &self)
+             { return nb::make_iterator(nb::type<SigningKey>(), "iterator", self.key_bytes.begin(), self.key_bytes.end()); });
+
+    m.def("compute_content_hash_fast", [](const std::vector<uint8_t> &json_bytes)
+          {
         auto result = compute_content_hash_fast(std::span<const uint8_t>(json_bytes));
-        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size()));
-    });
-    m.def("compute_content_hash", [](const nb::dict& event_dict) {
+        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size())); });
+    m.def("compute_content_hash", [](const nb::dict &event_dict)
+          {
         auto result = compute_content_hash(event_dict);
-        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size()));
-    });
-    m.def("compute_event_reference_hash_fast", [](const std::string& event_json) {
+        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size())); });
+    m.def("compute_event_reference_hash_fast", [](const std::string &event_json)
+          {
         auto result = compute_content_hash_fast(event_json);
-        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size()));
-    });
-    m.def("compute_event_reference_hash", [](const nb::dict& event_dict) {
+        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size())); });
+    m.def("compute_event_reference_hash", [](const nb::dict &event_dict)
+          {
         auto result = compute_content_hash(event_dict);
-        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size()));
-    });
-    m.def("sign_json_fast", [](const std::vector<uint8_t>& json_bytes, const std::vector<uint8_t>& signing_key_bytes) {
-        return sign_json_fast(std::span<const uint8_t>(json_bytes), signing_key_bytes);
-    });
+        return std::make_pair(result.first, nb::bytes(reinterpret_cast<const char*>(result.second.data()), result.second.size())); });
+    m.def("sign_json_fast", [](const std::vector<uint8_t> &json_bytes, const std::vector<uint8_t> &signing_key_bytes)
+          { return sign_json_fast(std::span<const uint8_t>(json_bytes), signing_key_bytes); });
     m.def("sign_json_with_info", &sign_json_with_info);
-    m.def("verify_signature_fast", [](const std::vector<uint8_t>& json_bytes, const std::string& signature_b64, const std::vector<uint8_t>& verify_key_bytes) {
-        return verify_signature_fast(std::span<const uint8_t>(json_bytes), signature_b64, verify_key_bytes);
-    });
+    m.def("verify_signature_fast", [](const std::vector<uint8_t> &json_bytes, const std::string &signature_b64, const std::vector<uint8_t> &verify_key_bytes)
+          { return verify_signature_fast(std::span<const uint8_t>(json_bytes), signature_b64, verify_key_bytes); });
     m.def("verify_signature_with_info", &verify_signature_with_info);
     m.def("sign_json_object_fast", &sign_json_object_fast);
     m.def("verify_signed_json_fast", &verify_signed_json_fast);
-    m.def("get_verify_key", [](const SigningKey& signing_key) {
-        return signing_key.get_verify_key();
-    });
-    m.def("get_verify_key", [](const std::vector<uint8_t>& signing_key_bytes) {
+    m.def("get_verify_key", [](const SigningKey &signing_key)
+          { return signing_key.get_verify_key(); });
+    m.def("get_verify_key", [](const std::vector<uint8_t> &signing_key_bytes)
+          {
         auto verify_key_bytes = get_verify_key(signing_key_bytes);
-        return VerifyKey(verify_key_bytes, "ed25519", "1");
-    });
-    m.def("get_verify_key", [](const nb::object& signing_key) {
+        return VerifyKey(verify_key_bytes, "ed25519", "1"); });
+    m.def("get_verify_key", [](const nb::object &signing_key)
+          {
         // Handle nacl.signing.SigningKey and other objects with encode() method
         if (nb::hasattr(signing_key, "encode")) {
             nb::bytes encoded = nb::cast<nb::bytes>(signing_key.attr("encode")());
@@ -181,20 +286,26 @@ NB_MODULE(_event_signing_impl, m) {
                 return VerifyKey(verify_key_bytes, "ed25519", version);
             }
         }
-        throw std::runtime_error("Invalid signing key object");
-    });
-    m.def("encode_base64_fast", [](nb::bytes data) {
+        throw std::runtime_error("Invalid signing key object"); });
+    m.def("encode_base64_fast", [](nb::bytes data)
+          {
         const char* ptr = static_cast<const char*>(data.c_str());
         size_t size = data.size();
         
         std::vector<uint8_t> vec_data(ptr, ptr + size);
-        return nb::str(base64_encode(vec_data).c_str());
-    });
-    m.def("decode_base64_fast", [](const std::string& encoded) {
-        auto result = base64_decode(encoded);
-        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
-    });
-    m.def("encode_base64", [](const nb::object& data) {
+        return nb::str(base64_encode(vec_data).c_str()); });
+    m.def("decode_base64_fast", [](const std::string &encoded)
+          {
+        // Remove whitespace like standard library does
+        std::string clean_encoded = encoded;
+        clean_encoded.erase(std::remove_if(clean_encoded.begin(), clean_encoded.end(), [](char c) {
+            return std::isspace(static_cast<unsigned char>(c));
+        }), clean_encoded.end());
+        
+        auto result = base64_decode(clean_encoded);
+        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size()); });
+    m.def("encode_base64", [](const nb::object &data)
+          {
         if (nb::isinstance<nb::bytes>(data)) {
             nb::bytes bytes_data = nb::cast<nb::bytes>(data);
             const char* ptr = static_cast<const char*>(bytes_data.c_str());
@@ -204,10 +315,10 @@ NB_MODULE(_event_signing_impl, m) {
         } else {
             std::vector<uint8_t> vec_data = nb::cast<std::vector<uint8_t>>(data);
             return nb::str(base64_encode(vec_data).c_str());
-        }
-    });
+        } });
     // Synapse-compatible overload with urlsafe parameter
-    m.def("encode_base64", [](nb::bytes data, bool urlsafe = false) {
+    m.def("encode_base64", [](nb::bytes data, bool urlsafe = false)
+          {
         const char* ptr = static_cast<const char*>(data.c_str());
         size_t size = data.size();
         std::vector<uint8_t> vec_data(ptr, ptr + size);
@@ -219,10 +330,10 @@ NB_MODULE(_event_signing_impl, m) {
             std::replace(result.begin(), result.end(), '/', '_');
         }
         
-        return nb::str(result.c_str());
-    }, "input_bytes"_a, "urlsafe"_a = false);
+        return nb::str(result.c_str()); }, "input_bytes"_a, "urlsafe"_a = false);
     // Additional overload for vector input (Synapse compatibility)
-    m.def("encode_base64", [](const std::vector<uint8_t>& data, bool urlsafe = false) {
+    m.def("encode_base64", [](const std::vector<uint8_t> &data, bool urlsafe = false)
+          {
         std::string result = base64_encode(data);
         
         // Convert to URL-safe if requested
@@ -231,10 +342,10 @@ NB_MODULE(_event_signing_impl, m) {
             std::replace(result.begin(), result.end(), '/', '_');
         }
         
-        return nb::str(result.c_str());
-    }, "input_bytes"_a, "urlsafe"_a = false);
+        return nb::str(result.c_str()); }, "input_bytes"_a, "urlsafe"_a = false);
     // Padded base64 encoding function
-    m.def("encode_base64_padded", [](const nb::object& data, bool urlsafe = false) {
+    m.def("encode_base64_padded", [](const nb::object &data, bool urlsafe = false)
+          {
         DEBUG_LOG("encode_base64_padded called, urlsafe=" + std::string(urlsafe ? "true" : "false"));
         
         if (data.ptr() == Py_None) {
@@ -271,14 +382,20 @@ NB_MODULE(_event_signing_impl, m) {
         
         auto output = nb::bytes(result.c_str(), result.size());
         DEBUG_LOG("encode_base64_padded: returning bytes, size=" + std::to_string(result.size()));
-        return output;
-    }, nb::arg("data").none(true), "urlsafe"_a = false);
-    m.def("decode_base64", [](const std::string& encoded) {
-        auto result = base64_decode(encoded);
-        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
-    });
+        return output; }, nb::arg("data").none(true), "urlsafe"_a = false);
+    m.def("decode_base64", [](const std::string &encoded)
+          {
+        // Remove whitespace like standard library does
+        std::string clean_encoded = encoded;
+        clean_encoded.erase(std::remove_if(clean_encoded.begin(), clean_encoded.end(), [](char c) {
+            return std::isspace(static_cast<unsigned char>(c));
+        }), clean_encoded.end());
+        
+        auto result = base64_decode(clean_encoded);
+        return nb::bytes(reinterpret_cast<const char*>(result.data()), result.size()); });
     // Padded base64 decoding function
-    m.def("decode_base64_padded", [](const nb::object& encoded) {
+    m.def("decode_base64_padded", [](const nb::object &encoded)
+          {
         DEBUG_LOG("decode_base64_padded called");
         
         if (encoded.ptr() == Py_None) {
@@ -329,53 +446,65 @@ NB_MODULE(_event_signing_impl, m) {
         
         auto output = nb::bytes(reinterpret_cast<const char*>(result.data()), result.size());
         DEBUG_LOG("decode_base64_padded: returning bytes, size=" + std::to_string(result.size()));
-        return output;
-    }, nb::arg("encoded").none(true));
-    m.def("encode_verify_key_base64", [](const std::vector<uint8_t>& key_bytes) {
-        return nb::str(base64_encode(key_bytes).c_str());
-    });
-    m.def("encode_verify_key_base64", [](const VerifyKey& verify_key) {
+        return output; }, nb::arg("encoded").none(true));
+    m.def("encode_verify_key_base64", [](const std::vector<uint8_t> &key_bytes)
+          { return nb::str(base64_encode(key_bytes).c_str()); });
+    m.def("encode_verify_key_base64", [](const VerifyKey &verify_key)
+          {
         nb::bytes encoded = verify_key.encode();
         const char* ptr = static_cast<const char*>(encoded.c_str());
         size_t size = encoded.size();
         std::vector<uint8_t> key_bytes(ptr, ptr + size);
-        return nb::str(base64_encode(key_bytes).c_str());
-    });
-    m.def("encode_verify_key_base64", [](const nb::object& key) {
+        return nb::str(base64_encode(key_bytes).c_str()); });
+    m.def("encode_verify_key_base64", [](const nb::object &key)
+          {
         // Handle any object with encode() method (nacl.signing.VerifyKey compatibility)
         nb::bytes encoded = nb::cast<nb::bytes>(key.attr("encode")());
         const char* ptr = static_cast<const char*>(encoded.c_str());
         size_t size = encoded.size();
         std::vector<uint8_t> key_bytes(ptr, ptr + size);
-        return nb::str(base64_encode(key_bytes).c_str());
-    });
-    m.def("encode_signing_key_base64", [](const std::vector<uint8_t>& key_bytes) {
-        return nb::str(base64_encode(key_bytes).c_str());
-    });
-    m.def("encode_signing_key_base64", [](const SigningKey& signing_key) {
+        return nb::str(base64_encode(key_bytes).c_str()); });
+    m.def("encode_signing_key_base64", [](const std::vector<uint8_t> &key_bytes)
+          { return nb::str(base64_encode(key_bytes).c_str()); });
+    m.def("encode_signing_key_base64", [](const SigningKey &signing_key)
+          {
         nb::bytes encoded = signing_key.encode();
         const char* ptr = static_cast<const char*>(encoded.c_str());
         size_t size = encoded.size();
         std::vector<uint8_t> key_bytes(ptr, ptr + size);
-        return nb::str(base64_encode(key_bytes).c_str());
-    });
-    m.def("decode_verify_key_base64", [](const std::string& algorithm, const std::string& version, const std::string& key_base64) {
+        return nb::str(base64_encode(key_bytes).c_str()); });
+    m.def("decode_verify_key_base64", [](const std::string &algorithm, const std::string &version, const std::string &key_base64)
+          {
         if (algorithm != "ed25519") throw std::runtime_error("Unsupported algorithm");
-        auto key_bytes = base64_decode(key_base64);
+        
+        // Remove whitespace like standard library does
+        std::string clean_key = key_base64;
+        clean_key.erase(std::remove_if(clean_key.begin(), clean_key.end(), [](char c) {
+            return std::isspace(static_cast<unsigned char>(c));
+        }), clean_key.end());
+        
+        auto key_bytes = base64_decode(clean_key);
         if (key_bytes.size() != 32) throw std::runtime_error("Invalid key length");
-        return VerifyKey(key_bytes, algorithm, version);
-    });
-    m.def("decode_signing_key_base64", [](const std::string& algorithm, const std::string& version, const std::string& key_base64) {
+        return VerifyKey(key_bytes, algorithm, version); });
+    m.def("decode_signing_key_base64", [](const std::string &algorithm, const std::string &version, const std::string &key_base64)
+          {
         if (algorithm != "ed25519") throw std::runtime_error("Unsupported algorithm");
-        auto key_bytes = base64_decode(key_base64);
+        
+        // Remove whitespace like standard library does
+        std::string clean_key = key_base64;
+        clean_key.erase(std::remove_if(clean_key.begin(), clean_key.end(), [](char c) {
+            return std::isspace(static_cast<unsigned char>(c));
+        }), clean_key.end());
+        
+        auto key_bytes = base64_decode(clean_key);
         if (key_bytes.size() != 32) throw std::runtime_error("Invalid key length");
-        return SigningKey(key_bytes, algorithm, version);
-    });
-    m.def("decode_verify_key_bytes_fast", [](std::string_view key_id, const std::vector<uint8_t>& key_bytes) {
+        return SigningKey(key_bytes, algorithm, version); });
+    m.def("decode_verify_key_bytes_fast", [](std::string_view key_id, const std::vector<uint8_t> &key_bytes)
+          {
         if (key_id.starts_with("ed25519:") && key_bytes.size() == 32) return key_bytes;
-        throw std::runtime_error("Unsupported key type or invalid key length");
-    });
-    m.def("decode_verify_key_bytes", [](std::string_view key_id, const nb::object& key_data) -> VerifyKeyWithExpiry {
+        throw std::runtime_error("Unsupported key type or invalid key length"); });
+    m.def("decode_verify_key_bytes", [](std::string_view key_id, const nb::object &key_data) -> VerifyKeyWithExpiry
+          {
         std::vector<uint8_t> key_bytes;
         
         if (nb::isinstance<nb::bytes>(key_data)) {
@@ -392,28 +521,39 @@ NB_MODULE(_event_signing_impl, m) {
             std::string version = (colon_pos != std::string::npos) ? std::string(key_id.substr(colon_pos + 1)) : "1";
             return VerifyKeyWithExpiry(key_bytes, "ed25519", version);
         }
-        throw std::runtime_error("Unsupported key type or invalid key length");
-    });
-    m.def("is_signing_algorithm_supported", [](std::string_view key_id) {
-        return key_id.starts_with("ed25519:");
-    });
-    m.def("encode_canonical_json", [](const nb::object& input) {
-        // Handle None/null values
-        if (input.ptr() == Py_None) {
-            return nb::bytes("null", 4);
-        }
-        
-        if (nb::isinstance<nb::dict>(input)) {
-            nb::dict json_dict = nb::cast<nb::dict>(input);
-            init_json_buffer(json_dict.size());
-        } else {
-            init_json_buffer();
-        }
-        py_to_canonical_json_fast(input);
+        throw std::runtime_error("Unsupported key type or invalid key length"); });
+    m.def("is_signing_algorithm_supported", [](std::string_view key_id)
+          { return key_id.starts_with("ed25519:"); });
+    m.def("encode_canonical_json", [](const nb::object &input)
+          {
+    if (input.ptr() == Py_None)
+        return nb::bytes("null", 4);
+
+    // Fast path: input is already JSON text. Skip normalization.
+    if (nb::isinstance<nb::str>(input) || nb::isinstance<nb::bytes>(input)) {
+        init_json_buffer();
+        py_to_canonical_json_fast(input);  // feed text/bytes directly
         auto span = get_json_span();
         return nb::bytes(span.data(), span.size());
-    }, nb::arg("input").none(true));
-    m.def("signature_ids", [](const nb::dict& json_dict, const std::string& signature_name) {
+    }
+
+    // Object path: normalize to JSON-native types
+    nb::object processed = normalize_for_canonical_json(input);
+
+    if (nb::isinstance<nb::dict>(processed)) {
+        nb::dict d = nb::cast<nb::dict>(processed);
+        init_json_buffer(d.size());
+    } else {
+        init_json_buffer();
+    }
+
+    py_to_canonical_json_fast(processed);
+
+    auto span = get_json_span();
+    return nb::bytes(span.data(), span.size()); }, nb::arg("input").none(true));
+
+    m.def("signature_ids", [](const nb::dict &json_dict, const std::string &signature_name)
+          {
         std::vector<std::string> ids;
         if (json_dict.contains("signatures")) {
             nb::dict signatures = nb::cast<nb::dict>(json_dict["signatures"]);
@@ -425,10 +565,10 @@ NB_MODULE(_event_signing_impl, m) {
                 }
             }
         }
-        return ids;
-    });
+        return ids; });
     // Alias functions to match Rust API exactly
-    m.def("sign_json", [](nb::dict& json_object, const std::string& signature_name, const nb::object& signing_key) -> nb::dict {
+    m.def("sign_json", [](nb::dict &json_object, const std::string &signature_name, const nb::object &signing_key) -> nb::dict
+          {
         std::string alg, version, key_id;
         
         // Try to get alg and version attributes (our SigningKey objects)
@@ -459,12 +599,11 @@ NB_MODULE(_event_signing_impl, m) {
         }
         
         // Return the signed dictionary for compatibility with Synapse's compute_event_signature
-        return signed_dict;
-    });
-    m.def("verify_signature", [](const std::vector<uint8_t>& json_bytes, const std::string& signature_b64, const std::vector<uint8_t>& verify_key_bytes) {
-        return verify_signature_fast(std::span<const uint8_t>(json_bytes), signature_b64, verify_key_bytes);
-    });
-    m.def("verify_signed_json", [](const nb::dict& json_dict, const std::string& signature_name, const nb::object& verify_key) {
+        return signed_dict; });
+    m.def("verify_signature", [](const std::vector<uint8_t> &json_bytes, const std::string &signature_b64, const std::vector<uint8_t> &verify_key_bytes)
+          { return verify_signature_fast(std::span<const uint8_t>(json_bytes), signature_b64, verify_key_bytes); });
+    m.def("verify_signed_json", [](const nb::dict &json_dict, const std::string &signature_name, const nb::object &verify_key)
+          {
         DEBUG_LOG("verify_signed_json: signature_name=" + signature_name);
         
         // Extract key info like Rust version
@@ -601,20 +740,20 @@ NB_MODULE(_event_signing_impl, m) {
             throw SignatureVerifyException("Unable to verify signature for " + signature_name);
         }
         
-        DEBUG_LOG("Signature verification completed successfully");
-    });
+        DEBUG_LOG("Signature verification completed successfully"); });
     // Key management functions with version parameter (ignores version for compatibility)
-    m.def("generate_signing_key", [](const std::string& key_id) { 
+    m.def("generate_signing_key", [](const std::string &key_id)
+          { 
         DEBUG_LOG("generate_signing_key called with key_id: " + key_id);
         auto key_bytes = generate_signing_key();
         // Use key_id as version for compatibility with signedjson
-        return SigningKey(key_bytes, "ed25519", key_id);
-    });
-    m.def("generate_signing_key", []() { 
+        return SigningKey(key_bytes, "ed25519", key_id); });
+    m.def("generate_signing_key", []()
+          { 
         auto key_bytes = generate_signing_key();
-        return SigningKey(key_bytes, "ed25519", "1");
-    });
-    m.def("read_signing_keys", [](const nb::object& input_data) {
+        return SigningKey(key_bytes, "ed25519", "1"); });
+    m.def("read_signing_keys", [](const nb::object &input_data)
+          {
         DEBUG_LOG("read_signing_keys called");
         
         // Handle different input types like Python signedjson
@@ -713,13 +852,12 @@ NB_MODULE(_event_signing_impl, m) {
         }
         
         DEBUG_LOG("Returning " + std::to_string(signing_keys.size()) + " signing keys");
-        return signing_keys;
-    });
-    m.def("read_old_signing_keys", [](const nb::object& stream_content) {
-        return nb::list();
-    });
+        return signing_keys; });
+    m.def("read_old_signing_keys", [](const nb::object &stream_content)
+          { return nb::list(); });
     // Original signedjson signature: write_signing_keys(stream, keys)
-    m.def("write_signing_keys", [](const nb::object& stream, const nb::object& keys) {
+    m.def("write_signing_keys", [](const nb::object &stream, const nb::object &keys)
+          {
         std::string output;
         
         // Convert keys to list (handle both tuples and lists)
@@ -760,6 +898,5 @@ NB_MODULE(_event_signing_impl, m) {
         // Write to stream
         if (nb::hasattr(stream, "write")) {
             stream.attr("write")(output);
-        }
-    });
+        } });
 }
