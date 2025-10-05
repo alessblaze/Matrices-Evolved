@@ -815,7 +815,7 @@ impl UnifiedCache {
                         nodes.push(node.clone_ref(py));
                     } else if let Some(node_id) = entry.node_id {
                         // Create node on demand
-                        if let Ok(node) = self.create_eviction_node(cache_ref, py, key, &[], Some(node_id)) {
+                        if let Ok(node) = self.create_eviction_node(cache_ref, py, key, &[], Some(node_id), None) {
                             entry.node = Some(node.clone_ref(py));
                             nodes.push(node);
                         }
@@ -827,9 +827,27 @@ impl UnifiedCache {
     }
     
     /// Create a node for global eviction system integration
-    fn create_eviction_node(&self, cache_ref: &Arc<RwLock<UnifiedCache>>, py: Python, key: &Arc<CacheKey>, callbacks: &[Py<PyAny>], existing_node_id: Option<u64>) -> PyResult<Py<RustCacheNode>> {
+    fn create_eviction_node(&self, cache_ref: &Arc<RwLock<UnifiedCache>>, py: Python, key: &Arc<CacheKey>, callbacks: &[Py<PyAny>], existing_node_id: Option<u64>, clock: Option<Py<PyAny>>) -> PyResult<Py<RustCacheNode>> {
         let node_id = existing_node_id.unwrap_or_else(|| NODE_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
-        let now = get_relative_time_ms();
+        
+        // Use clock time if provided, otherwise use system time
+        let now = if let Some(clock_obj) = clock {
+            if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
+                if let Ok(time_result) = time_method.call0() {
+                    if let Ok(time_seconds) = time_result.extract::<f64>() {
+                        python_time_to_relative_ms(time_seconds)
+                    } else {
+                        get_relative_time_ms()
+                    }
+                } else {
+                    get_relative_time_ms()
+                }
+            } else {
+                get_relative_time_ms()
+            }
+        } else {
+            get_relative_time_ms()
+        };
         
         let node = RustCacheNode {
             cache: Arc::downgrade(cache_ref),
@@ -1769,6 +1787,16 @@ impl UnifiedCache {
         
         Ok(results)
     }
+    
+    /// Get the oldest key in the cache (FIFO order).
+    /// Returns None if cache is empty.
+    /// Time complexity: O(1).
+    pub fn get_oldest_key(&self) -> Option<Arc<CacheKey>> {
+        let global_eviction = self.global_eviction.read();
+        global_eviction.tail
+            .and_then(|tail_id| global_eviction.nodes.get(&tail_id))
+            .map(|node| node.key.clone())
+    }
 }
 
 #[pyclass]
@@ -1970,9 +1998,29 @@ impl RustCacheNode {
         self.last_access_time.load(Ordering::Relaxed) as f64 / 1000.0
     }
     
+    /// Get absolute last access time (epoch milliseconds)
+    fn get_last_access_time_absolute(&self) -> u64 {
+        self.last_access_time.load(Ordering::Relaxed) + *CACHE_START_TIME
+    }
+    
+    /// Get absolute last access time (epoch seconds)
+    fn get_last_access_time_absolute_seconds(&self) -> f64 {
+        (self.last_access_time.load(Ordering::Relaxed) + *CACHE_START_TIME) as f64 / 1000.0
+    }
+    
     /// Get creation time in Python clock seconds (for compatibility)
     fn get_creation_time_seconds(&self) -> f64 {
         self.creation_time as f64 / 1000.0
+    }
+    
+    /// Get absolute creation time (epoch milliseconds)
+    fn get_creation_time_absolute(&self) -> u64 {
+        self.creation_time + *CACHE_START_TIME
+    }
+    
+    /// Get absolute creation time (epoch seconds)
+    fn get_creation_time_absolute_seconds(&self) -> f64 {
+        (self.creation_time + *CACHE_START_TIME) as f64 / 1000.0
     }
     
     /// Get access count
@@ -1989,6 +2037,30 @@ impl RustCacheNode {
     fn is_older_than_seconds(&self, time_seconds: f64) -> bool {
         let time_ms = python_time_to_relative_ms(time_seconds);
         self.last_access_time.load(Ordering::Relaxed) < time_ms
+    }
+    
+    /// Get age since creation in milliseconds (expects absolute epoch time)
+    fn get_age_since_creation_ms(&self, current_absolute_time_ms: u64) -> u64 {
+        let current_relative_time = current_absolute_time_ms.saturating_sub(*CACHE_START_TIME);
+        current_relative_time.saturating_sub(self.creation_time)
+    }
+    
+    /// Get age since creation in seconds (expects absolute epoch seconds)
+    fn get_age_since_creation_seconds(&self, current_absolute_time_seconds: f64) -> f64 {
+        let current_absolute_ms = (current_absolute_time_seconds * 1000.0) as u64;
+        let current_relative_time = current_absolute_ms.saturating_sub(*CACHE_START_TIME);
+        (current_relative_time.saturating_sub(self.creation_time)) as f64 / 1000.0
+    }
+    
+    /// Get age since creation in milliseconds (expects relative time)
+    fn get_age_since_creation_relative_ms(&self, current_relative_time_ms: u64) -> u64 {
+        current_relative_time_ms.saturating_sub(self.creation_time)
+    }
+    
+    /// Get age since creation in seconds (expects relative time)
+    fn get_age_since_creation_relative_seconds(&self, current_relative_time_seconds: f64) -> f64 {
+        let current_relative_ms = (current_relative_time_seconds * 1000.0) as u64;
+        (current_relative_ms.saturating_sub(self.creation_time)) as f64 / 1000.0
     }
     
     /// Get memory usage of this node
@@ -2134,11 +2206,21 @@ impl RustCacheNode {
         Ok(changed)
     }
     
-    /// Update access time for global eviction
+    /// Update access time for global eviction (no clock parameter version)
     fn update_access_time(&self) {
         let now = get_relative_time_ms();
         self.last_access_time.store(now, Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Update access time with optional clock parameter
+    fn update_access_time_with_clock(&self, py: Python, clock: Option<Py<PyAny>>) {
+        self.update_last_access(py, clock);
+    }
+    
+    /// Get current relative time (for age calculations)
+    fn get_current_relative_time_ms(&self) -> u64 {
+        get_relative_time_ms()
     }
     
 
@@ -2197,6 +2279,12 @@ impl RustLruCache {
     /// Inserts or updates a cache entry with automatic callback execution.
     /// Executes evicted callbacks outside the mutex lock to prevent deadlocks.
     fn set(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>, callbacks: Option<Vec<Py<PyAny>>>) -> PyResult<()> {
+        self.set_with_clock(py, key, value, callbacks, None)
+    }
+    
+    /// Inserts or updates a cache entry with optional clock for time tracking.
+    /// Executes evicted callbacks outside the mutex lock to prevent deadlocks.
+    fn set_with_clock(&self, py: Python, key: &Bound<'_, PyAny>, value: Py<PyAny>, callbacks: Option<Vec<Py<PyAny>>>, clock: Option<Py<PyAny>>) -> PyResult<()> {
         let callbacks = callbacks.unwrap_or_default();
         
         let (evicted_callbacks, needs_node) = {
@@ -2222,13 +2310,13 @@ impl RustLruCache {
         if needs_node {
             let cache_key = Arc::new(CacheKey::from_bound(key)?);
             
-            // Create the node first
+            // Create the node first with clock parameter
             let node = {
                 let cache = self.cache.read();
                 let shard_index = cache.get_shard_index(&cache_key);
                 let shard = cache.shards[shard_index].read();
                 let existing_node_id = shard.data.get(&cache_key).and_then(|e| e.node_id);
-                cache.create_eviction_node(&self.cache, py, &cache_key, &[], existing_node_id)
+                cache.create_eviction_node(&self.cache, py, &cache_key, &[], existing_node_id, clock.as_ref().map(|c| c.clone_ref(py)))
             }?;
             
             // Then update the entry - re-check existence after concurrent removal
@@ -2534,6 +2622,16 @@ impl RustLruCache {
         }
     }
     
+    /// Peek at a cache value without updating LRU position or metrics
+    #[pyo3(signature = (key, default=None))]
+    fn peek(&self, py: Python, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        let cache = self.cache.read();
+        match cache.get(py, key, None, false, false)? {
+            Some(value) => Ok(value),
+            None => Ok(default.unwrap_or_else(|| py.None()))
+        }
+    }
+    
     /// Enable automatic node creation for global eviction tracking
     fn enable_node_tracking(&self) -> PyResult<()> {
         let mut cache = self.cache.write();
@@ -2601,6 +2699,44 @@ impl RustLruCache {
         let cache = self.cache.read();
         Ok(cache.evictions_invalidation.load(std::sync::atomic::Ordering::Relaxed))
     }
+    
+    /// Get the oldest key in the cache (FIFO order)
+    fn get_oldest_key(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        let cache = self.cache.read();
+        if let Some(oldest_key) = cache.get_oldest_key() {
+            // Reconstruct Python key from CacheKey
+            fn reconstruct_key(key: &CacheKey, py: Python) -> PyResult<Py<PyAny>> {
+                match key {
+                    CacheKey::String(s) => Ok(PyString::new(py, s).into()),
+                    CacheKey::IntSmall(i) => Ok(PyInt::new(py, *i).into()),
+                    CacheKey::IntBig(bi) => {
+                        let s = bi.to_string();
+                        if let Ok(i) = s.parse::<i64>() {
+                            Ok(PyInt::new(py, i).into())
+                        } else {
+                            let py_long = py.import("builtins")?.getattr("int")?.call1((&s,))?;
+                            Ok(py_long.unbind())
+                        }
+                    },
+                    CacheKey::None => Ok(py.None()),
+                    CacheKey::Tuple(parts) => {
+                        let py_parts: PyResult<Vec<_>> = parts.iter()
+                            .map(|part| reconstruct_key(part, py))
+                            .collect();
+                        let tuple = PyTuple::new(py, py_parts?)?;
+                        Ok(tuple.into())
+                    },
+                    CacheKey::Hashed { type_name, py_hash, obj_id } => {
+                        Ok(PyString::new(py, &format!("{}#{}@{}", type_name, py_hash, obj_id)).into())
+                    }
+                }
+            }
+            Ok(Some(reconstruct_key(&oldest_key, py)?))
+        } else {
+            Ok(None)
+        }
+    }
+    
 }
 
 #[pymethods]
