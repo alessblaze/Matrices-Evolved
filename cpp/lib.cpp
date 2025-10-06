@@ -42,6 +42,8 @@ You should have received a copy of the License along with this program; if not, 
 // Module includes - restructured cpp directory (header-only)
 #include "base64/encoders/include/base64-encoder.h"
 #include "base64/decoders/include/base64-decoder.h"
+#include "json/encoder.h"
+#include "json/decoder.h"
 #include "json/canonicalization.h"
 #include "crypto/ed25519.h"
 
@@ -2042,4 +2044,12 @@ NB_MODULE(_event_signing_impl, m)
         if (nb::hasattr(stream, "write")) {
             stream.attr("write")(output);
         } });
+    
+    // JSON encoder - equivalent to json.dumps() with compact separators
+    m.def("json_encode", &json_encode, "Encode Python object to JSON string", 
+          nb::arg("obj"), nb::arg("preserve_utf8") = false);
+    
+    // JSON decoder - equivalent to json.loads()
+    m.def("json_decode", [](const std::string &json_str)
+          { return json_decode(json_str); });
 }

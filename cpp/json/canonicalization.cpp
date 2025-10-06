@@ -122,6 +122,11 @@ ALWAYS_INLINE bool has_decimal_point_sse(const char* str, size_t len) {
  * @throws std::runtime_error if conversion fails
  */
 int fast_double_to_string(double f, char* result) {
+    // Reject non-finite values (NaN, infinity)
+    if (!std::isfinite(f)) {
+        throw std::runtime_error("Non-finite floats not allowed in JSON");
+    }
+    
     // Normalize negative zero to positive zero
     if (f == 0.0 && std::signbit(f)) f = 0.0;
     
@@ -255,6 +260,23 @@ ALWAYS_INLINE void ensure_space(size_t needed) {
 ALWAYS_INLINE void write_char(char c) {
     ensure_space(1);
     *json_ptr++ = c;
+}
+
+// Non-inline versions for external linkage
+void write_char_external(char c) {
+    write_char(c);
+}
+
+void write_string_external(std::string_view s) {
+    write_string(s);
+}
+
+void write_cstring_external(const char* s) {
+    write_cstring(s);
+}
+
+void write_unicode_escape_external(unsigned char c) {
+    write_unicode_escape(c);
 }
 
 /**
@@ -1180,6 +1202,13 @@ std::string sign_json_fast(std::span<const uint8_t> json_bytes, const std::vecto
     }
     
     return base64_encode(json_signature_buffer);
+}
+
+/**
+ * Reset JSON pointer to buffer start
+ */
+void reset_json_pointer() {
+    json_ptr = json_buffer.data();
 }
 
 // Explicit template instantiations for get_json_span

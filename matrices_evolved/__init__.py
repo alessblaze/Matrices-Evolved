@@ -75,6 +75,8 @@ __all__ = [
     
     # JSON functions
     'encode_canonical_json',
+    'json_encode',
+    'json_decode',
     'signature_ids',
     
     # High-level API

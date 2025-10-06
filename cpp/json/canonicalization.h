@@ -63,6 +63,7 @@ extern template std::span<uint8_t> get_json_span<std::span<uint8_t>>();
 [[gnu::hot, gnu::flatten]] void py_to_canonical_json_fast(const nb::object& root_obj);
 std::string sign_json_fast(std::span<const uint8_t> json_bytes, const std::vector<uint8_t>& signing_key_bytes);
 void init_json_buffer(size_t hint = 0);
+void reset_json_pointer();
 std::vector<uint8_t> generate_signing_key();
 std::string canonicalize_json_fast(const json::value& jv);
 void serialize_canonical_fast(const json::value& v);
@@ -77,6 +78,12 @@ void write_raw_unsafe(const char* data, size_t len);
 void write_cstring(const char* s);
 void write_unicode_escape(unsigned char c);
 void write_unicode_escape_unsafe(unsigned char c);
+
+// External linkage versions
+void write_char_external(char c);
+void write_string_external(std::string_view s);
+void write_cstring_external(const char* s);
+void write_unicode_escape_external(unsigned char c);
 int fast_double_to_string(double f, char* result);
 
 #ifdef __AVX2__

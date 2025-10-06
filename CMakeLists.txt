@@ -108,6 +108,8 @@ message(STATUS "AWS-LC crypto lib: ${AWS_LC_BUILD}/crypto/libcrypto.a")
 set(CPP_SOURCES
     cpp/lib.cpp
     cpp/json/canonicalization.cpp
+    cpp/json/encoder.cpp
+    cpp/json/decoder.cpp
     cpp/crypto/ed25519.cpp
 )
 
@@ -120,6 +122,8 @@ list(APPEND CPP_SOURCES ${ENCODER_SOURCES} ${DECODER_SOURCES})
 set(CPP_HEADERS
     cpp/global.h
     cpp/json/canonicalization.h
+    cpp/json/encoder.h
+    cpp/json/decoder.h
     cpp/crypto/ed25519.h
 )
 
@@ -145,7 +149,7 @@ add_dependencies(aws_lc_crypto aws-lc)
 target_link_libraries(_event_signing_impl PRIVATE aws_lc_crypto)
 target_link_options(_event_signing_impl PRIVATE -fuse-ld=lld-20)
 set_target_properties(_event_signing_impl PROPERTIES LINK_FLAGS "-fuse-ld=lld-20")
-target_compile_options(_event_signing_impl PRIVATE -fPIC -Wno-nan-infinity-disabled)
+target_compile_options(_event_signing_impl PRIVATE -fPIC)
 target_compile_features(_event_signing_impl PRIVATE cxx_std_23)
 
 # Check for C++23 feature availability
@@ -188,10 +192,9 @@ function(apply_optimizations target)
     
     # Base optimization flags 
     target_compile_options(${target} PRIVATE
-        -O3 -ffast-math
+        -O3 -fno-math-errno -fno-trapping-math
         -funroll-loops -fomit-frame-pointer
         -fno-stack-protector
-        -funsafe-math-optimizations
         -fno-plt -fno-semantic-interposition
         -fmerge-all-constants
         -DNDEBUG -DBOOST_DISABLE_ASSERTS
