@@ -124,7 +124,9 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_json_fast(const nb::object& root_obj) {
                             break;
                         }
                     }
+                    #ifdef __x86_64__ 
                     _mm256_zeroupper();
+                    #endif
 #endif
                     
                     while (i < len) {
@@ -219,7 +221,9 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_json_fast(const nb::object& root_obj) {
                             escape[4] = _mm_extract_epi32(hex_chars, 2);
                             escape[5] = _mm_extract_epi32(hex_chars, 3);
                             write_string_external(std::string_view(escape, 6));
+                            #ifdef __x86_64__ 
                             _mm256_zeroupper();
+                            #endif
 #else
                             // Scalar hex digit generation
                             static const char hex_table[] = "0123456789abcdef";

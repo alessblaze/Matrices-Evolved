@@ -125,7 +125,9 @@ struct StructuralIndex {
             }
             pos += 32;
         }
+        #ifdef __x86_64__ 
         _mm256_zeroupper();
+        #endif
 #endif
         // Scalar tail
         while (pos < len) {
@@ -205,7 +207,9 @@ struct JsonParser {
             }
             pos += 32;
         }
+        #ifdef __x86_64__ 
         _mm256_zeroupper();
+        #endif
 #endif
         while (pos < len && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\n' || data[pos] == '\r')) pos++;
     }
@@ -303,6 +307,7 @@ struct JsonParser {
         pos++;
         size_t start = pos;
         
+#ifdef __AVX2__
         // Fast path: scan for end quote using SIMD
         while (pos + 32 <= len) {
             __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + pos));
@@ -318,6 +323,10 @@ struct JsonParser {
             }
             pos += 32;
         }
+        #ifdef __x86_64__ 
+        _mm256_zeroupper();
+        #endif
+#endif
         
         // Handle escapes and find actual end
         std::string result;
@@ -432,16 +441,21 @@ struct JsonParser {
                             throw std::invalid_argument("Unpaired low surrogate");
                         }
                         
-                        // SSE UTF-8 encoding for small codepoints
+                        // UTF-8 encoding
                         if (codepoint < 0x80) {
                             result += static_cast<char>(codepoint);
                         } else if (codepoint < 0x800) {
+#ifdef __SSE2__
                             // SSE 2-byte UTF-8 encoding
                             __m128i cp = _mm_cvtsi32_si128(codepoint);
                             __m128i byte1 = _mm_or_si128(_mm_set1_epi8(0xC0), _mm_srli_epi32(cp, 6));
                             __m128i byte2 = _mm_or_si128(_mm_set1_epi8(0x80), _mm_and_si128(cp, _mm_set1_epi32(0x3F)));
                             result += static_cast<char>(_mm_cvtsi128_si32(byte1));
                             result += static_cast<char>(_mm_cvtsi128_si32(byte2));
+#else
+                            result += static_cast<char>(0xC0 | (codepoint >> 6));
+                            result += static_cast<char>(0x80 | (codepoint & 0x3F));
+#endif
                         } else if (codepoint < 0x10000) {
                             result += static_cast<char>(0xE0 | (codepoint >> 12));
                             result += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
@@ -495,8 +509,8 @@ struct JsonParser {
                 throw std::invalid_argument("Leading zeros not allowed");
             }
         } else {
-            // Vectorized digit scanning with parallel accumulation
-            uint64_t acc = 0;
+#ifdef __AVX2__
+            // Vectorized digit scanning
             while (pos + 32 <= len) {
                 __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + pos));
                 __m256i digit_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8('0'));
@@ -509,12 +523,12 @@ struct JsonParser {
                     pos += __builtin_ctz(~mask);
                     break;
                 }
-                
-                // Skip SIMD accumulation - use std::from_chars for correctness
-                
                 pos += 32;
             }
+            #ifdef __x86_64__ 
             _mm256_zeroupper();
+            #endif
+#endif
             while (pos < len && std::isdigit(static_cast<unsigned char>(data[pos]))) pos++;
         }
         
