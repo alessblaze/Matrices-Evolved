@@ -68,6 +68,7 @@ std::vector<uint8_t> generate_signing_key();
 std::string canonicalize_json_fast(const json::value& jv);
 void serialize_canonical_fast(const json::value& v);
 std::string base64_encode(const std::vector<uint8_t>& data);
+std::vector<std::vector<uint8_t>> iterencode_canonical_json_fast(const nb::object& root_obj, size_t chunk_size);
 
 // Internal helper functions
 void ensure_space(size_t needed);

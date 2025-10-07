@@ -1039,6 +1039,30 @@ void reset_json_pointer() {
     json_ptr = json_buffer.data();
 }
 
+/**
+ * Streaming canonical JSON encoder - returns chunks
+ * @param root_obj Python object to canonicalize
+ * @param chunk_size Maximum bytes per chunk
+ * @return Vector of byte chunks
+ */
+std::vector<std::vector<uint8_t>> iterencode_canonical_json_fast(const nb::object& root_obj, size_t chunk_size) {
+    init_json_buffer(0);
+    py_to_canonical_json_fast(root_obj);
+    
+    auto json_span = get_json_span<std::span<const uint8_t>>();
+    
+    std::vector<std::vector<uint8_t>> chunks;
+    size_t pos = 0;
+    while (pos < json_span.size()) {
+        size_t chunk_len = std::min(chunk_size, json_span.size() - pos);
+        std::vector<uint8_t> chunk(json_span.data() + pos, json_span.data() + pos + chunk_len);
+        chunks.push_back(std::move(chunk));
+        pos += chunk_len;
+    }
+    
+    return chunks;
+}
+
 // Explicit template instantiations for get_json_span
 template std::vector<uint8_t> get_json_span<std::vector<uint8_t>>();
 template std::span<const uint8_t> get_json_span<std::span<const uint8_t>>();

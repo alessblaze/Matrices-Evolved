@@ -2052,4 +2052,18 @@ NB_MODULE(_event_signing_impl, m)
     // JSON decoder - equivalent to json.loads()
     m.def("json_decode", [](const std::string &json_str)
           { return json_decode(json_str); });
+    
+    // Streaming canonical JSON encoder
+    m.def("iterencode_canonical_json", [](const nb::object &input, size_t chunk_size = 64 * 1024)
+          {
+        if (chunk_size == 0) {
+            throw std::invalid_argument("chunk_size must be greater than 0");
+        }
+        auto chunks_vec = iterencode_canonical_json_fast(input, chunk_size);
+        nb::list chunks;
+        for (const auto& chunk : chunks_vec) {
+            nb::bytes chunk_bytes(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+            chunks.append(chunk_bytes);
+        }
+        return chunks; }, "input"_a, "chunk_size"_a = 64 * 1024);
 }
