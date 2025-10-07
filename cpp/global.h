@@ -91,7 +91,7 @@ static bool debug_enabled = []() {
 static constexpr char hex_lut[] = "0123456789abcdef";
 
 // Maximum event size to prevent DoS attacks
-static constexpr size_t MAX_EVENT_SIZE = 1024 * 1024; // 1 MB
+static constexpr size_t MAX_EVENT_SIZE = 50 * 1024 * 1024; // 10 MB
 
 // Shared exception classes
 class SignatureVerifyException : public std::runtime_error {

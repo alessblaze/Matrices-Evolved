@@ -19,10 +19,18 @@ You should have received a copy of the License along with this program; if not, 
 */
 
 #include "canonicalization.h"
-#include <boost/json/src.hpp>
+#include <boost/json/src.hpp> // kept for future use. we dont use boost::json anymore
+#include <charconv>
+#include <iostream>
+#include <iomanip>
 
 namespace nb = nanobind;
-namespace json = boost::json;
+//boost::json is undoubtedly very good library, but it's fate in our codebase was defined.
+//boost parses the integers to scientific notation which causes mismatch in certain cases
+//like timestamps where the other side might not parse it the correct way.
+//nevertheless maybe we will use some important feature for it. boost library is linked and kept
+//for future use.
+namespace json = boost::json; 
 
 // Compiler attributes
 #ifdef __clang__
@@ -117,11 +125,15 @@ ALWAYS_INLINE bool has_decimal_point_sse(const char* str, size_t len) {
  * 4. Normalize -0.0 to 0.0 for canonical representation
  * 
  * @param f Input double value (must be finite)
- * @param result Output buffer (minimum 32 bytes)
+ * @param result Output buffer (dynamically sized, starts at 64 bytes)
  * @return Length of written string
  * @throws std::runtime_error if conversion fails
  */
 int fast_double_to_string(double f, char* result) {
+    if (debug_enabled) {
+        std::cout << "DEBUG fast_double_to_string: input=" << std::scientific << f << " (" << std::fixed << f << ")" << std::endl;
+    }
+    
     // Reject non-finite values (NaN, infinity)
     if (!std::isfinite(f)) {
         throw std::runtime_error("Non-finite floats not allowed in JSON");
@@ -133,34 +145,43 @@ int fast_double_to_string(double f, char* result) {
     // Fast paths for common values (already normalized)
     if (f == 0.0) {
         result[0] = '0'; result[1] = '.'; result[2] = '0';
+        if (debug_enabled) std::cout << "DEBUG fast_double_to_string: fast path 0.0 -> \"0.0\"" << std::endl;
         return 3;
     }
     if (f == 1.0) {
         result[0] = '1'; result[1] = '.'; result[2] = '0';
+        if (debug_enabled) std::cout << "DEBUG fast_double_to_string: fast path 1.0 -> \"1.0\"" << std::endl;
         return 3;
     }
     
-    // Use std::to_chars with safe buffer size (32 bytes minimum required)
-    auto [ptr, ec] = std::to_chars(result, result + 32, f);
-    if (ec == std::errc{}) {
-        int len = ptr - result;
-        
-        // SSE2-optimized decimal point detection
-#if defined (__AVX2__) || defined (__ARM_NEON)
-        bool has_dot = has_decimal_point_sse(result, len);
-#else
-        bool has_dot = false;
-        for (int i = 0; i < len; i++) {
-            if (result[i] == '.' || result[i] == 'e' || result[i] == 'E') {
-                has_dot = true;
-                break;
-            }
+    // Safe temporary buffer with dynamic growth
+    std::vector<char> tmp(64);
+    std::errc ec;
+    char* ptr;
+    
+    do {
+        auto [p, e] = std::to_chars(tmp.data(), tmp.data() + tmp.size(), f, std::chars_format::fixed);
+        ptr = p;
+        ec = e;
+        if (ec == std::errc::value_too_large) {
+            tmp.resize(tmp.size() * 2);
+            if (tmp.size() > 2048) break;
         }
-#endif
+    } while (ec == std::errc::value_too_large);
+    if (ec == std::errc{}) {
+        int len = ptr - tmp.data();
+        std::string raw_output(tmp.data(), len);
+        if (debug_enabled) {
+            std::cout << "DEBUG fast_double_to_string: std::to_chars output=\"" << raw_output << "\"" << std::endl;
+        }
         
-        if (!has_dot) {
-            result[len++] = '.';
-            result[len++] = '0';
+        // std::chars_format::fixed always includes decimal point, no need to check
+        
+        // Copy to result buffer
+        std::memcpy(result, tmp.data(), len);
+        std::string final_output(result, len);
+        if (debug_enabled) {
+            std::cout << "DEBUG fast_double_to_string: final output=\"" << final_output << "\"" << std::endl;
         }
         return len;
     }
@@ -478,12 +499,16 @@ ALWAYS_INLINE std::string vectorized_hex_string(const uint8_t* data, size_t size
 #endif
 
 HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& root_obj) {
-    // Ensure GIL is held for Python API calls
     if (!PyGILState_Check()) {
         throw std::runtime_error("py_to_canonical_json_fast requires the Python GIL");
     }
     
-    // Function-local stack to avoid reentrancy issues
+    size_t hint = 0;
+    if (nb::isinstance<nb::dict>(root_obj)) {
+        hint = nb::len(root_obj);
+    }
+    init_json_buffer(hint);
+    
     std::vector<Task> stack;
     stack.reserve(512);
     stack.push_back({TaskType::VALUE, root_obj});
@@ -501,9 +526,19 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                 } else if (nb::isinstance<nb::bool_>(obj)) {
                     write_cstring(nb::cast<bool>(obj) ? "true" : "false");
                 } else if (nb::isinstance<nb::int_>(obj)) {
-                    char buf[32];
-                    auto [ptr, ec] = std::to_chars(buf, buf + 32, nb::cast<int64_t>(obj));
-                    write_string(std::string_view(buf, ptr - buf));
+                    // Handle big integers via Python str() to avoid truncation
+                    int overflow;
+                    int64_t val = PyLong_AsLongLongAndOverflow(obj.ptr(), &overflow);
+                    if (overflow == 0) {
+                        // Fast path for 64-bit integers
+                        char buf[32];
+                        auto [ptr, ec] = std::to_chars(buf, buf + 32, val);
+                        write_string(std::string_view(buf, ptr - buf));
+                    } else {
+                        // Big integer - use Python str()
+                        std::string int_str = nb::cast<std::string>(nb::str(obj));
+                        write_string(int_str);
+                    }
                 } else if (nb::isinstance<nb::float_>(obj)) {
                     double val = nb::cast<double>(obj);
                     if (!std::isfinite(val)) {
@@ -709,7 +744,7 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                                 case '\r': write_string("\\r"); break;
                                 case '\t': write_string("\\t"); break;
                                 default:
-                                    if (c < 0x20) write_unicode_escape_unsafe(c);
+                                    if (c < 0x20) write_unicode_escape(c);
                                     else write_char(static_cast<char>(c));
                             }
                         }
@@ -849,19 +884,35 @@ HOT_FUNCTION FLATTEN_FUNCTION void py_to_canonical_json_fast(const nb::object& r
                         
                         for (; i < len; ++i) {
                             unsigned char c = static_cast<unsigned char>(data[i]);
-                            if (c == '"') write_raw_unsafe("\\\"", 2);
-                            else if (c == '\\') write_raw_unsafe("\\\\", 2);
-                            else if (c < 0x20) write_unicode_escape_unsafe(c);
-                            else write_char(static_cast<char>(c));
+                            switch (c) {
+                                case '"': write_raw_unsafe("\\\"", 2); break;
+                                case '\\': write_raw_unsafe("\\\\", 2); break;
+                                case '\b': write_raw_unsafe("\\b", 2); break;
+                                case '\f': write_raw_unsafe("\\f", 2); break;
+                                case '\n': write_raw_unsafe("\\n", 2); break;
+                                case '\r': write_raw_unsafe("\\r", 2); break;
+                                case '\t': write_raw_unsafe("\\t", 2); break;
+                                default:
+                                    if (c < 0x20) write_unicode_escape_unsafe(c);
+                                    else write_char(static_cast<char>(c));
+                            }
                         }
                     } else {
 #endif
                         for (char ch : key) {
                             unsigned char c = static_cast<unsigned char>(ch);
-                            if (c == '"') write_raw("\\\"", 2);
-                            else if (c == '\\') write_raw("\\\\", 2);
-                            else if (c < 0x20) write_unicode_escape_unsafe(c);
-                            else write_char(static_cast<char>(c));
+                            switch (c) {
+                                case '"': write_raw("\\\"", 2); break;
+                                case '\\': write_raw("\\\\", 2); break;
+                                case '\b': write_raw("\\b", 2); break;
+                                case '\f': write_raw("\\f", 2); break;
+                                case '\n': write_raw("\\n", 2); break;
+                                case '\r': write_raw("\\r", 2); break;
+                                case '\t': write_raw("\\t", 2); break;
+                                default:
+                                    if (c < 0x20) write_unicode_escape(c);
+                                    else write_char(static_cast<char>(c));
+                            }
                         }
 #if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
                     }
@@ -895,232 +946,9 @@ thread_local EVP_PKEY* cached_signing_pkey = nullptr;
 
 
 
-// Fast canonical serializer using buffer writer - no sorting needed for boost::json::object
-void serialize_canonical_fast(const json::value& v) {
-    switch (v.kind()) {
-        case json::kind::object: {
-            write_char('{');
-            const auto& obj = v.as_object();
-            bool first = true;
-            
-            // boost::json::object maintains key ordering
-            for (const auto& kv : obj) {
-                if (!first) write_char(',');
-                first = false;
-                
-                // Escape JSON string characters with bulk operations
-                write_char('"');
-                std::string_view key = kv.key();
-                
-                // Use bulk string copying for clean segments
-                DEBUG_LOG("Processing JSON key: \"" + std::string(key) + "\" (" + std::to_string(key.size()) + " bytes)");
-                size_t start = 0;
-                for (size_t i = 0; i < key.size(); ++i) {
-                    char c = key[i];
-                    if (c == '"' || c == '\\' || c < 0x20) {
-                        // Write clean segment before escape character
-                        if (i > start) {
-                            write_string(key.substr(start, i - start));
-                        }
-                        
-                        // Write escape sequence
-                        if (c == '"') write_string("\\\"");
-                        else if (c == '\\') write_string("\\\\");
-                        else {
-                            write_unicode_escape(static_cast<unsigned char>(c));
-                        }
-                        
-                        start = i + 1;
-                    }
-                }
-                
-                // Write remaining clean segment
-                if (start < key.size()) {
-                    write_string(key.substr(start));
-                }
-                write_char('"');
-                write_char(':');
-                serialize_canonical_fast(kv.value());
-            }
-            write_char('}');
-            break;
-        }
-        case json::kind::array: {
-            write_char('[');
-            const auto& arr = v.as_array();
-            
-            DEBUG_LOG("Processing JSON array with " + std::to_string(arr.size()) + " elements");
-            
-            // Vectorized comma insertion for large primitive arrays
-            if (arr.size() >= 32) {
-                DEBUG_LOG("Large array detected - using optimized processing");
-                // Pre-reserve space for commas
-                ensure_space(arr.size());
-            }
-            
-            for (size_t i = 0; i < arr.size(); ++i) {
-                if (i > 0) write_char(',');
-                serialize_canonical_fast(arr[i]);
-            }
-            write_char(']');
-            break;
-        }
-        case json::kind::string: {
-            write_char('"');
-            std::string_view s = v.as_string();
-            
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
-            // Use AVX2 vectorized string escaping for large strings
-            if (s.size() >= 32) {
-                DEBUG_LOG("Using AVX2 vectorized JSON string escaping for " + std::to_string(s.size()) + " bytes");
-                const char* data = s.data();
-                size_t len = s.size();
-                size_t i = 0;
-                
-                const __m256i control_threshold = _mm256_set1_epi8(static_cast<char>(0x20 ^ 0x80));
-                const __m256i xor_mask = _mm256_set1_epi8(0x80);
-                const __m256i quote_mask = _mm256_set1_epi8('"');
-                const __m256i backslash_mask = _mm256_set1_epi8('\\');
-                const __m256i b_mask = _mm256_set1_epi8('\b');
-                const __m256i f_mask = _mm256_set1_epi8('\f');
-                const __m256i n_mask = _mm256_set1_epi8('\n');
-                const __m256i r_mask = _mm256_set1_epi8('\r');
-                const __m256i t_mask = _mm256_set1_epi8('\t');
-                
-                // Process 32-byte chunks
-                for (; i + 32 <= len; i += 32) {
-                    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
-                    
-                    __m256i xored = _mm256_xor_si256(chunk, xor_mask);
-                    __m256i control_cmp = _mm256_cmpgt_epi8(control_threshold, xored);
-                    __m256i quote_cmp = _mm256_cmpeq_epi8(chunk, quote_mask);
-                    __m256i backslash_cmp = _mm256_cmpeq_epi8(chunk, backslash_mask);
-                    __m256i b_cmp = _mm256_cmpeq_epi8(chunk, b_mask);
-                    __m256i f_cmp = _mm256_cmpeq_epi8(chunk, f_mask);
-                    __m256i n_cmp = _mm256_cmpeq_epi8(chunk, n_mask);
-                    __m256i r_cmp = _mm256_cmpeq_epi8(chunk, r_mask);
-                    __m256i t_cmp = _mm256_cmpeq_epi8(chunk, t_mask);
-                    
-                    __m256i escape_mask = _mm256_or_si256(
-                        _mm256_or_si256(_mm256_or_si256(control_cmp, quote_cmp), 
-                                       _mm256_or_si256(backslash_cmp, b_cmp)),
-                        _mm256_or_si256(_mm256_or_si256(f_cmp, n_cmp), 
-                                       _mm256_or_si256(r_cmp, t_cmp))
-                    );
-                    
-                    if (_mm256_testz_si256(escape_mask, escape_mask)) {
-                        // Clean chunk - bulk copy
-                        write_raw(data + i, 32);
-                    } else {
-                        // Process character by character for this chunk
-                        for (size_t j = 0; j < 32; ++j) {
-                            char c = data[i + j];
-                            if (c == '"') write_string("\\\"");
-                            else if (c == '\\') write_string("\\\\");
-                            else if (c == '\b') write_string("\\b");
-                            else if (c == '\f') write_string("\\f");
-                            else if (c == '\n') write_string("\\n");
-                            else if (c == '\r') write_string("\\r");
-                            else if (c == '\t') write_string("\\t");
-                            else if (c < 0x20) {
-                                write_unicode_escape(static_cast<unsigned char>(c));
-                            } else {
-                                write_char(c);
-                            }
-                        }
-                    }
-                }
-                
-                // Handle remaining bytes with scalar
-                for (; i < len; ++i) {
-                    unsigned char c = static_cast<unsigned char>(data[i]);
-                    if (c == '"') write_string("\\\"");
-                    else if (c == '\\') write_string("\\\\");
-                    else if (c == '\b') write_string("\\b");
-                    else if (c == '\f') write_string("\\f");
-                    else if (c == '\n') write_string("\\n");
-                    else if (c == '\r') write_string("\\r");
-                    else if (c == '\t') write_string("\\t");
-                    else if (c < 0x20) {
-                        write_unicode_escape_unsafe(c);
-                    } else {
-                        write_char(static_cast<char>(c));
-                    }
-                }
-            } else {
-#endif
-                // Scalar fallback for small strings or non-AVX2
-                DEBUG_LOG("Using scalar JSON string processing for " + std::to_string(s.size()) + " bytes (< 32 or no AVX2)");
-                for (size_t i = 0; i < s.size(); ++i) {
-                    unsigned char c = static_cast<unsigned char>(s[i]);
-                    if (c == '"') write_string("\\\"");
-                    else if (c == '\\') write_string("\\\\");
-                    else if (c == '\b') write_string("\\b");
-                    else if (c == '\f') write_string("\\f");
-                    else if (c == '\n') write_string("\\n");
-                    else if (c == '\r') write_string("\\r");
-                    else if (c == '\t') write_string("\\t");
-                    else if (c < 0x20) {
-                        write_unicode_escape_unsafe(c);
-                    } else {
-                        write_char(static_cast<char>(c));
-                    }
-                }
-#if defined(__AVX2__) && !defined(DISABLE_AVX2_JSON_SIMD) || defined(__ARM_NEON) && !defined(DISABLE_AVX2_JSON_SIMD)
-            }
-#endif
-            write_char('"');
-            break;
-        }
-        case json::kind::int64: {
-            char buf[32];
-            auto [ptr, ec] = std::to_chars(buf, buf + 32, v.as_int64());
-            if (ec != std::errc{}) {
-                throw std::runtime_error("Failed to convert integer to string");
-            }
-            write_string(std::string_view(buf, ptr - buf));
-            break;
-        }
-        case json::kind::uint64: {
-            char buf[32];
-            auto [ptr, ec] = std::to_chars(buf, buf + 32, v.as_uint64());
-            if (ec != std::errc{}) {
-                throw std::runtime_error("Failed to convert unsigned integer to string");
-            }
-            write_string(std::string_view(buf, ptr - buf));
-            break;
-        }
-        case json::kind::double_: {
-            double val = v.as_double();
-            if (!std::isfinite(val)) throw std::runtime_error("Non-finite floats not allowed");
-            
-            char buf[32];
-            int len = fast_double_to_string(val, buf);
-            
-            // Decimal point added by fast_double_to_string
-            
-            write_string(std::string_view(buf, len));
-            break;
-        }
-        case json::kind::bool_:
-            write_cstring(v.as_bool() ? "true" : "false");
-            break;
-        case json::kind::null:
-            write_cstring("null");
-            break;
-    }
-}
 
 
 
-std::string canonicalize_json_fast(const json::value& jv) {
-    // Pre-allocate large buffer to avoid reallocations
-    init_json_buffer();
-    
-    serialize_canonical_fast(jv);
-    
-    return std::string(json_buffer.data(), json_ptr - json_buffer.data());
-}
 
 
 
