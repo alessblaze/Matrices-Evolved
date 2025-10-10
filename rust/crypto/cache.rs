@@ -31,25 +31,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ahash::AHasher;
 
-// Global timer for relative time tracking
-static CACHE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
+
+
+// Get absolute time in milliseconds (Unix timestamp)
+fn get_absolute_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-});
-
-// Get relative time in milliseconds since cache system started
-fn get_relative_time_ms() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    now.saturating_sub(*CACHE_START_TIME)
 }
 
 // Convert Python clock time (seconds) to our relative time (milliseconds)
-fn python_time_to_relative_ms(python_seconds: f64) -> u64 {
+fn python_time_to_absolute_ms(python_seconds: f64) -> u64 {
     (python_seconds * 1000.0) as u64
 }
 
@@ -229,8 +222,7 @@ pub struct RustCacheNode {
     key: Arc<CacheKey>,
     node_id: u64,
     callbacks: Option<Vec<Py<PyAny>>>,
-    // Time-based eviction fields
-    last_access_time: AtomicU64,
+    // Time-based eviction fields - now references GlobalEvictionNode
     creation_time: u64,
     access_count: AtomicU64,
 }
@@ -336,6 +328,7 @@ struct GlobalEvictionNode {
     prev: Option<u64>,
     next: Option<u64>,
     access_order: u64,
+    last_access_time_ms: u64,
 }
 
 impl GlobalEvictionList {
@@ -349,10 +342,12 @@ impl GlobalEvictionList {
     }
     
     fn move_to_front(&mut self, node_id: u64) {
+        let now = get_absolute_time_ms();
         if self.head == Some(node_id) { 
-            // Update access order even if already at head
+            // Update access order and time even if already at head
             if let Some(node) = self.nodes.get_mut(&node_id) {
                 node.access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+                node.last_access_time_ms = now;
             }
             return; 
         }
@@ -377,11 +372,12 @@ impl GlobalEvictionList {
             self.tail = prev;
         }
         
-        // Move to front
+        // Move to front - only update the specific node
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.prev = None;
             node.next = self.head;
             node.access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+            node.last_access_time_ms = now;
         }
         
         if let Some(old_head) = self.head {
@@ -398,12 +394,14 @@ impl GlobalEvictionList {
     
     fn add_node(&mut self, node_id: u64, key: Arc<CacheKey>, shard_index: usize) {
         let access_order = self.access_counter.fetch_add(1, Ordering::Relaxed);
+        let now = get_absolute_time_ms();
         let node = GlobalEvictionNode {
             key: key.clone(),
             shard_index,
             prev: None,
             next: self.head,
             access_order,
+            last_access_time_ms: now,
         };
         
         if let Some(old_head) = self.head {
@@ -835,18 +833,18 @@ impl UnifiedCache {
             if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
                 if let Ok(time_result) = time_method.call0() {
                     if let Ok(time_seconds) = time_result.extract::<f64>() {
-                        python_time_to_relative_ms(time_seconds)
+                        python_time_to_absolute_ms(time_seconds)
                     } else {
-                        get_relative_time_ms()
+                        get_absolute_time_ms()
                     }
                 } else {
-                    get_relative_time_ms()
+                    get_absolute_time_ms()
                 }
             } else {
-                get_relative_time_ms()
+                get_absolute_time_ms()
             }
         } else {
-            get_relative_time_ms()
+            get_absolute_time_ms()
         };
         
         let node = RustCacheNode {
@@ -858,7 +856,6 @@ impl UnifiedCache {
             } else { 
                 Some(callbacks.iter().map(|cb| cb.clone_ref(py)).collect()) 
             },
-            last_access_time: AtomicU64::new(now),
             creation_time: now,
             access_count: AtomicU64::new(0),
         };
@@ -1470,12 +1467,27 @@ impl UnifiedCache {
         self.shards[shard_index].read().data.contains_key(key)
     }
     
-    /// Updates LRU position for a key without returning the value
+    /// Updates LRU position for a key without returning the value.
+    /// Also updates global eviction list access time to defer time-based eviction.
+    /// For LRU-only updates without time-based eviction deferral, use get(update_last_access=False).
     pub fn touch_key(&self, key: &Arc<CacheKey>) {
         let shard_index = self.get_shard_index(key);
-        let mut shard = self.shards[shard_index].write();
-        if shard.data.contains_key(key) {
-            self.move_to_front_shard(&mut shard, key);
+        let node_id = {
+            let shard = self.shards[shard_index].read();
+            shard.data.get(key).and_then(|entry| entry.node_id)
+        };
+        
+        if node_id.is_some() {
+            let mut shard = self.shards[shard_index].write();
+            if shard.data.contains_key(key) {
+                self.move_to_front_shard(&mut shard, key);
+            }
+        }
+        
+        // Update global eviction list access time
+        if let Some(node_id) = node_id {
+            let mut global_eviction = self.global_eviction.write();
+            global_eviction.move_to_front(node_id);
         }
     }
     
@@ -1505,6 +1517,9 @@ impl UnifiedCache {
         self.prefix_cache.write().clear();
         self.prefix_counts.write().clear();
         self.hierarchy.write().clear();
+        self.global_eviction.write().nodes.clear();
+        self.global_eviction.write().head = None;
+        self.global_eviction.write().tail = None;
         self.memory_usage.store(0, Ordering::Relaxed);
         
         rust_debug_fast!("UnifiedCache::clear() completed for cache '{}', cleared {} entries, {} callbacks", self.name, count, all_callbacks.len());
@@ -1797,6 +1812,75 @@ impl UnifiedCache {
             .and_then(|tail_id| global_eviction.nodes.get(&tail_id))
             .map(|node| node.key.clone())
     }
+    
+    /// Evict entries older than the specified time in milliseconds
+    pub fn evict_older_than_ms(&self, py: Python, cutoff_time_ms: u64) -> Vec<(Arc<CacheKey>, CacheEntry)> {
+        let mut removed_entries = Vec::new();
+        
+        // Walk from oldest (tail) to newest, stop at first recent entry
+        loop {
+            let (node_id, key, shard_index, last_access) = {
+                let global_eviction = self.global_eviction.read();
+                if let Some(tail_id) = global_eviction.tail {
+                    if let Some(node) = global_eviction.nodes.get(&tail_id) {
+                        (tail_id, node.key.clone(), node.shard_index, node.last_access_time_ms)
+                    } else {
+                        break; // Stale tail
+                    }
+                } else {
+                    break; // Empty list
+                }
+            };
+            
+            // Stop if this entry is too recent (keep entries with last_access >= cutoff_time_ms)
+            if last_access >= cutoff_time_ms {
+                break;
+            }
+            
+            let (entry, value_copy) = {
+                let mut shard = self.shards[shard_index].write();
+                if let Some(entry) = shard.data.remove(&key) {
+                    let value_copy = entry.value.clone_ref(py);
+                    self.remove_from_lru_shard(&mut shard, &key);
+                    (Some(entry), Some(value_copy))
+                } else {
+                    (None, None)
+                }
+            };
+            
+            if let (Some(entry), Some(value_copy)) = (entry, value_copy) {
+                let size = if self.size_callback.read().is_some() {
+                    self.calculate_size_unlocked(py, &value_copy).unwrap_or(DEFAULT_ENTRY_SIZE)
+                } else {
+                    DEFAULT_ENTRY_SIZE
+                };
+                
+                {
+                    let mut shard = self.shards[shard_index].write();
+                    shard.current_size = shard.current_size.saturating_sub(size);
+                }
+                self.memory_usage.fetch_sub(size as u64, Ordering::Relaxed);
+                self.evictions_invalidation.fetch_add(1, Ordering::Relaxed);
+                
+                {
+                    let mut global_eviction = self.global_eviction.write();
+                    global_eviction.remove_node(node_id);
+                }
+                
+                let prefix_arcs = entry.prefix_arcs.clone();
+                if let Some(arcs) = prefix_arcs.as_ref() {
+                    Self::remove_hierarchy_static(&key, arcs, &self.prefix_cache, &self.prefix_counts, &self.hierarchy);
+                }
+                removed_entries.push((key, entry));
+            } else {
+                // Entry was already removed, just clean up the global list
+                let mut global_eviction = self.global_eviction.write();
+                global_eviction.remove_node(node_id);
+            }
+        }
+        
+        removed_entries
+    }
 }
 
 #[pyclass]
@@ -1947,26 +2031,6 @@ impl RustCacheNode {
     }
     
     fn update_last_access(&self, py: Python, clock: Option<Py<PyAny>>) {
-        // Use Python clock time if provided, otherwise use relative time
-        let now = if let Some(clock_obj) = clock {
-            if let Ok(time_method) = clock_obj.bind(py).getattr("time") {
-                if let Ok(time_result) = time_method.call0() {
-                    if let Ok(time_seconds) = time_result.extract::<f64>() {
-                        python_time_to_relative_ms(time_seconds)
-                    } else {
-                        get_relative_time_ms()
-                    }
-                } else {
-                    get_relative_time_ms()
-                }
-            } else {
-                get_relative_time_ms()
-            }
-        } else {
-            get_relative_time_ms()
-        };
-        
-        self.last_access_time.store(now, Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
         
         // Update LRU position in cache and global eviction list
@@ -1985,7 +2049,14 @@ impl RustCacheNode {
     
     /// Get last access time in relative milliseconds
     fn get_last_access_time(&self) -> u64 {
-        self.last_access_time.load(Ordering::Relaxed)
+        if let Some(cache_arc) = self.cache.upgrade() {
+            let cache = cache_arc.read();
+            let global_eviction = cache.global_eviction.read();
+            if let Some(node) = global_eviction.nodes.get(&self.node_id) {
+                return node.last_access_time_ms;
+            }
+        }
+        self.creation_time // Fallback to creation time
     }
     
     /// Get creation time in relative milliseconds
@@ -1995,17 +2066,17 @@ impl RustCacheNode {
     
     /// Get last access time in Python clock seconds (for compatibility)
     fn get_last_access_time_seconds(&self) -> f64 {
-        self.last_access_time.load(Ordering::Relaxed) as f64 / 1000.0
+        self.get_last_access_time() as f64 / 1000.0
     }
     
     /// Get absolute last access time (epoch milliseconds)
     fn get_last_access_time_absolute(&self) -> u64 {
-        self.last_access_time.load(Ordering::Relaxed) + *CACHE_START_TIME
+        self.get_last_access_time()
     }
     
     /// Get absolute last access time (epoch seconds)
     fn get_last_access_time_absolute_seconds(&self) -> f64 {
-        (self.last_access_time.load(Ordering::Relaxed) + *CACHE_START_TIME) as f64 / 1000.0
+        self.get_last_access_time() as f64 / 1000.0
     }
     
     /// Get creation time in Python clock seconds (for compatibility)
@@ -2015,12 +2086,12 @@ impl RustCacheNode {
     
     /// Get absolute creation time (epoch milliseconds)
     fn get_creation_time_absolute(&self) -> u64 {
-        self.creation_time + *CACHE_START_TIME
+        self.creation_time
     }
     
     /// Get absolute creation time (epoch seconds)
     fn get_creation_time_absolute_seconds(&self) -> f64 {
-        (self.creation_time + *CACHE_START_TIME) as f64 / 1000.0
+        self.creation_time as f64 / 1000.0
     }
     
     /// Get access count
@@ -2030,38 +2101,30 @@ impl RustCacheNode {
     
     /// Check if node is older than given time (for time-based eviction)
     fn is_older_than(&self, time_ms: u64) -> bool {
-        self.last_access_time.load(Ordering::Relaxed) < time_ms
+        self.get_last_access_time() < time_ms
     }
     
     /// Check if node is older than given Python clock time in seconds
     fn is_older_than_seconds(&self, time_seconds: f64) -> bool {
-        let time_ms = python_time_to_relative_ms(time_seconds);
-        self.last_access_time.load(Ordering::Relaxed) < time_ms
+        let time_ms = python_time_to_absolute_ms(time_seconds);
+        self.get_last_access_time() < time_ms
     }
     
-    /// Get age since creation in milliseconds (expects absolute epoch time)
+    /// Calculate age since creation in milliseconds using absolute Unix epoch time
     fn get_age_since_creation_ms(&self, current_absolute_time_ms: u64) -> u64 {
-        let current_relative_time = current_absolute_time_ms.saturating_sub(*CACHE_START_TIME);
-        current_relative_time.saturating_sub(self.creation_time)
+        current_absolute_time_ms.saturating_sub(self.creation_time)
     }
     
-    /// Get age since creation in seconds (expects absolute epoch seconds)
+    /// Calculate age since creation in seconds using absolute Unix epoch time
     fn get_age_since_creation_seconds(&self, current_absolute_time_seconds: f64) -> f64 {
         let current_absolute_ms = (current_absolute_time_seconds * 1000.0) as u64;
-        let current_relative_time = current_absolute_ms.saturating_sub(*CACHE_START_TIME);
-        (current_relative_time.saturating_sub(self.creation_time)) as f64 / 1000.0
+        (current_absolute_ms.saturating_sub(self.creation_time)) as f64 / 1000.0
     }
     
     /// Get age since creation in milliseconds (expects relative time)
-    fn get_age_since_creation_relative_ms(&self, current_relative_time_ms: u64) -> u64 {
-        current_relative_time_ms.saturating_sub(self.creation_time)
-    }
-    
+
     /// Get age since creation in seconds (expects relative time)
-    fn get_age_since_creation_relative_seconds(&self, current_relative_time_seconds: f64) -> f64 {
-        let current_relative_ms = (current_relative_time_seconds * 1000.0) as u64;
-        (current_relative_ms.saturating_sub(self.creation_time)) as f64 / 1000.0
-    }
+
     
     /// Get memory usage of this node
     fn get_memory_usage(&self) -> usize {
@@ -2208,9 +2271,12 @@ impl RustCacheNode {
     
     /// Update access time for global eviction (no clock parameter version)
     fn update_access_time(&self) {
-        let now = get_relative_time_ms();
-        self.last_access_time.store(now, Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(cache_arc) = self.cache.upgrade() {
+            let cache = cache_arc.read();
+            let mut global_eviction = cache.global_eviction.write();
+            global_eviction.move_to_front(self.node_id);
+        }
     }
     
     /// Update access time with optional clock parameter
@@ -2219,8 +2285,8 @@ impl RustCacheNode {
     }
     
     /// Get current relative time (for age calculations)
-    fn get_current_relative_time_ms(&self) -> u64 {
-        get_relative_time_ms()
+    fn get_current_time_ms(&self) -> u64 {
+        get_absolute_time_ms()
     }
     
 
@@ -2737,6 +2803,32 @@ impl RustLruCache {
         }
     }
     
+    /// Evict entries older than the specified time in seconds
+    fn evict_older_than(&self, py: Python, max_age_seconds: f64) -> PyResult<usize> {
+        let now = get_absolute_time_ms();
+        let max_age_ms = (max_age_seconds * 1000.0) as u64;
+        let cutoff_time = now.saturating_sub(max_age_ms);
+        let mut all_callbacks = Vec::new();
+        
+        let removed_entries = {
+            let cache = self.cache.read();
+            cache.evict_older_than_ms(py, cutoff_time)
+        };
+        
+        let evicted_count = removed_entries.len();
+        for (_, entry) in removed_entries {
+            all_callbacks.extend(entry.get_callbacks());
+        }
+        
+        for callback in all_callbacks {
+            if let Err(e) = callback.bind(py).call0() {
+                eprintln!("Cache callback error: {}", e);
+            }
+        }
+        
+        Ok(evicted_count)
+    }
+    
 }
 
 #[pymethods]
@@ -2883,6 +2975,37 @@ impl AsyncRustLruCache {
         rust_debug_fast!("AsyncRustLruCache::clear_sync() - all attempts failed, cache busy");
         Ok(0)
     }
+    
+    /// Evict entries older than the specified time in seconds (async version)
+    fn evict_older_than<'p>(&self, py: Python<'p>, max_age_seconds: f64) -> PyResult<Bound<'p, PyAny>> {
+        let cache = self.cache.clone();
+        let result = pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let now = get_absolute_time_ms();
+            let max_age_ms = (max_age_seconds * 1000.0) as u64;
+            let cutoff_time = now.saturating_sub(max_age_ms);
+            let mut all_callbacks = Vec::new();
+            
+            let removed_entries = {
+                let cache = cache.read().await;
+                Python::with_gil(|py| cache.evict_older_than_ms(py, cutoff_time))
+            };
+            
+            let evicted_count = removed_entries.len();
+            Python::with_gil(|py| {
+                for (_, entry) in removed_entries {
+                    all_callbacks.extend(entry.get_callbacks());
+                }
+                
+                for callback in all_callbacks {
+                    if let Err(e) = callback.bind(py).call0() {
+                        eprintln!("Cache callback error: {}", e);
+                    }
+                }
+                Ok(evicted_count)
+            })
+        });
+        result
+    }
 }
 
 /// Factory function to create a new RustLruCache instance from Python.
@@ -2908,6 +3031,26 @@ pub fn create_async_rust_lru_cache(
     callback_policy: Option<String>
 ) -> PyResult<AsyncRustLruCache> {
     Ok(AsyncRustLruCache::new(max_size, cache_name, metrics, callback_policy))
+}
+
+/// Global function to evict entries older than specified time from multiple caches
+#[pyfunction]
+pub fn evict_old_entries_from_caches(py: Python, caches: Vec<Py<PyAny>>, max_age_seconds: f64) -> PyResult<usize> {
+    let mut total_evicted = 0;
+    
+    for cache_obj in caches {
+        let cache_bound = cache_obj.bind(py);
+        
+        // Try RustLruCache first
+        if let Ok(cache) = cache_bound.downcast::<RustLruCache>() {
+            if let Ok(evicted) = cache.borrow().evict_older_than(py, max_age_seconds) {
+                total_evicted += evicted;
+            }
+        }
+        // Could add AsyncRustLruCache support here if needed
+    }
+    
+    Ok(total_evicted)
 }
 
 // Note: We don't need a custom tokio runtime initialization.
