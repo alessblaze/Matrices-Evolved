@@ -69,8 +69,9 @@ std::vector<uint8_t> base64_decode(std::string_view encoded_string) {
          auto simd_result = fast_base64_decode_avx2_rangecmp(encoded_string);
          #elif defined(__ARM_NEON)
          #pragma message("Compiling ARM NEON")
-         auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
+         auto simd_result = fast_base64_decode_neon_lut2x128(encoded_string);
          #endif
+         //auto simd_result = fast_base64_decode_neon_rangecmp(encoded_string);
          //auto simd_result = fast_base64_decode_signature(encoded_string);
          //auto simd_result = fast_base64_decode_neon_lut2x128(encoded_string);
          //auto simd_result = fast_base64_decode_sse_rangecmp(encoded_string);

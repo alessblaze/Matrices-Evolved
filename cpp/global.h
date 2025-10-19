@@ -36,7 +36,7 @@ You should have received a copy of the License along with this program; if not, 
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/pair.h>
 
-#if defined(__AVX2__) || defined(__ARM_NEON)
+#if defined(__x86_64__) || defined(_M_X64)
 //#include <immintrin.h>
 #include <simde/x86/sse2.h>
 #include <simde/x86/sse3.h>
@@ -52,10 +52,28 @@ You should have received a copy of the License along with this program; if not, 
 //#define DISABLE_AVX2_BASE64_DECODER
 #define DISABLE_SSE_BASE64_ENCODER_ALIGNED //pass
 #define DISABLE_SSE_BASE64_ENCODER_LEMIRE //pass
-//#define DISABLE_SSE_BASE64_ENCODER_AVX //pass - ENABLE AVX2 for speed
+//#define DISABLE_SSE_BASE64_ENCODER_AVX //pass 
 #define DISABLE_NEON_BASE64_ENCODER //pass
 
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <simde/x86/sse2.h>
+#include <simde/x86/sse3.h>
+#include <simde/x86/sse4.1.h>
+#include <simde/x86/sse4.2.h>
+#include <simde/x86/avx2.h>
+#include <simde/arm/neon.h>
+// Disable AVX2 SIMD for JSON canonicalization
+//#define DISABLE_AVX2_JSON_SIMD
+// Separate controls for base64 encoder/decoder
+#define DISABLE_SSE_BASE64_ENCODER //pass
+#define DISABLE_SSE_BASE64_ENCODER_MULA //pass
+//#define DISABLE_AVX2_BASE64_DECODER
+#define DISABLE_SSE_BASE64_ENCODER_ALIGNED //pass
+#define DISABLE_SSE_BASE64_ENCODER_LEMIRE //pass
+#define DISABLE_SSE_BASE64_ENCODER_AVX //pass 
+//#define DISABLE_NEON_BASE64_ENCODER //pass
 #endif
+
 
 
 // Compiler-specific optimization attributes
