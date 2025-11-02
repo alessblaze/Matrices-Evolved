@@ -23,8 +23,9 @@ You should have received a copy of the License along with this program; if not, 
 #if defined(__AVX2__)
 #include "include/ams-avx.h"
 #elif defined(__ARM_NEON)
-#include "include/ams-neon.h"
+#include "include/ams-neon-lut.h"
 #endif
+//#include "include/ams-neon.h"
 //#include "include/ams-sse.h"
 //#include "include/ams-neon-lut.h"
 // Thread-local decode buffer

@@ -132,7 +132,7 @@ file(GLOB_RECURSE ENCODER_HEADERS "cpp/base64/encoders/*.h")
 file(GLOB_RECURSE DECODER_HEADERS "cpp/base64/decoders/*.h")
 list(APPEND CPP_HEADERS ${ENCODER_HEADERS} ${DECODER_HEADERS})
 
-nanobind_add_module(_event_signing_impl STABLE_ABI NOMINSIZE LTO ${CPP_SOURCES} ${CPP_HEADERS})
+nanobind_add_module(_event_signing_impl NOMINSIZE LTO ${CPP_SOURCES} ${CPP_HEADERS})
 set_target_properties(_event_signing_impl PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION TRUE
     CXX_VISIBILITY_PRESET default
