@@ -20,8 +20,8 @@ echo "Building for arm64..."
 docker buildx build -t matrices-evolved-builder-arm64 --platform linux/arm64 --load .
 docker run --platform linux/arm64 --rm -v $(pwd):/host -w /src matrices-evolved-builder-arm64 bash -c "
     rsync -av --exclude=build --exclude=dist /host/ . && 
-    python3.11 -m build --wheel && 
-    auditwheel repair dist/*.whl -w wheelhouse/ && 
+    /opt/build-env/bin/python -m build --wheel && 
+    /opt/build-env/bin/python -m auditwheel repair dist/*.whl -w wheelhouse/ && 
     cp wheelhouse/* /host/wheelhouse/
 "
 
